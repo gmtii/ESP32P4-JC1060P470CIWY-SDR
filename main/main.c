@@ -20,8 +20,7 @@
 
 #include "iot_knob.h"
 #include "esp_ldo_regulator.h"
-#include "i2s_driver.h"
-#include "nau8822.h"
+#include "audio_out.h"
 #include "ui.h"
 #include "sdr.h"
 #include "agc.h"
@@ -79,7 +78,7 @@ const char *agc_texto[6] = {
     "AGC MED",
     "AGC FST"};
 
-VFO currentVFO = {.VFOName = "VFO-A", .Frec = 7350000, .demod_modo = DEMOD_LSB, .filtro = 0, .step = 1000, .AGC = true, .FLT = false, .SPLT = false, .NR_SS = false, .NR = false, .ANR = 0, .f_baja = 300, .f_alta = 2700};
+VFO currentVFO = {.VFOName = "VFO-A", .Frec = 7345000, .demod_modo = DEMOD_AM, .filtro = 0, .step = 1000, .AGC = true, .FLT = false, .SPLT = false, .NR_SS = false, .NR = false, .ANR = 0, .f_baja = 300, .f_alta = 2700};
 
 bool debug = false;
 bool nr_ss_debug;
@@ -209,8 +208,6 @@ void create_knob()
 
 void app_main(void)
 {
-    // ESP_ERROR_CHECK(bsp_extra_codec_init());
-
     bsp_display_cfg_t cfg = {
         .lvgl_port_cfg = ESP_LVGL_PORT_INIT_CONFIG(),
         .buffer_size = 1024 * 50,
@@ -228,14 +225,12 @@ void app_main(void)
 
     create_knob();
 
-    i2s_driver_init(SAMPLE_RATE);
-
-    nau8822_init(0); // Modo de inicialización del NAU8822
-
-    nau8822_init(7); // LIN RIN
-    // nau8822_init(8);
-
-    nau8822_spk_volume(0x20);
+    /* Audio output: on-board ES8311 through the BSP (playback only, 48 kHz) */
+    if (audio_out_init(SAMPLE_RATE) != ESP_OK)
+    {
+        ESP_LOGE(TAG, "audio output init failed, the receiver will run without sound");
+    }
+    audio_out_set_volume(50);
 
     /* RTL-SDR over USB Host replaces the MSI001 tuner + I2S RX input.
      * LO sits FREQ_CONV_OFFSET below the VFO, as sdr.c expects. */

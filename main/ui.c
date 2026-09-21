@@ -14,7 +14,7 @@
 #include "ui.h"
 #include "ui_priv.h"
 #include "agc.h"
-#include "nau8822.h"
+#include "audio_out.h"
 #include "smeter.h"
 #include "math.h"
 
@@ -282,7 +282,7 @@ static void slider_changed_cb(lv_event_t *e)
   lv_obj_t *s = lv_event_get_target_obj(e);
   int32_t v = lv_slider_get_value(s);
 
-  nau8822_spk_volume(v);
+  audio_out_set_volume((int)v);
 
   lv_label_set_text_fmt(value_label, "%d", v);
 }
@@ -379,8 +379,8 @@ void btn_event_cb(lv_event_t *e)
       {
         // slider_vol
         slider_vol = lv_slider_create(screen);
-        lv_slider_set_range(slider_vol, 0, 0x3f);
-        lv_slider_set_value(slider_vol, 0x1F, LV_ANIM_OFF);
+        lv_slider_set_range(slider_vol, 0, 100); /* percent of the ES8311 output range */
+        lv_slider_set_value(slider_vol, audio_out_get_volume(), LV_ANIM_OFF);
         lv_obj_set_style_bg_color(slider_vol, lv_color_hex(0x202020), LV_PART_MAIN);
         lv_obj_set_style_border_color(slider_vol, lv_color_hex(0x404040), LV_PART_MAIN);
 

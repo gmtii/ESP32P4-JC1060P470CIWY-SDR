@@ -5,7 +5,7 @@
 #include "stdbool.h"
 
 #include "esp_dsp.h"
-#include "driver/i2s_std.h"
+#include "esp_err.h"
 #include "esp_mac.h"
 #include "math.h"
 
@@ -15,6 +15,7 @@
 #include "sdr.h"
 #include "sdr_priv.h"
 #include "rtl_source.h"
+#include "audio_out.h"
 
 #include "agc.h"
 #include "nr.h"
@@ -88,7 +89,6 @@ void IRAM_ATTR sdrTask(void *args)
 {
 
     esp_err_t ret = ESP_OK;
-    size_t bytes_write = 0;
 
     sam_variables_init();
     dsps_fft2r_init_fc32(NULL, SAMPLE_BUFFER_SIZE);
@@ -144,7 +144,7 @@ void IRAM_ATTR sdrTask(void *args)
         {
             /* No dongle or stalled stream: keep the codec fed with silence */
             memset(sampleData_out, 0, sizeof(sampleData_out));
-            i2s_channel_write(tx_handle, (char *)&sampleData_out[0].sample, SAMPLE_BUFFER_SIZE * 4, &bytes_write, 100);
+            audio_out_write((const int16_t *)&sampleData_out[0].sample, SAMPLE_BUFFER_SIZE);
             continue;
         }
 
@@ -344,7 +344,7 @@ void IRAM_ATTR sdrTask(void *args)
         }
 
         // Envia el DAC SAMPLE_BUFFER_SIZE * 4 ( 2 canales, 16 bit cada uno)
-        ret = i2s_channel_write(tx_handle, (char *)&sampleData_out[0].sample, SAMPLE_BUFFER_SIZE * 4, &bytes_write, 100);
+        ret = audio_out_write((const int16_t *)&sampleData_out[0].sample, SAMPLE_BUFFER_SIZE);
     }
 
     // vTaskDelete(NULL);

@@ -4,7 +4,6 @@
 
 #include "uart_commands.h"
 #include "msi001.h"
-#include "nau8822.h"
 
 #define UART_NUM UART_NUM_0
 #define BUF_SIZE 1024

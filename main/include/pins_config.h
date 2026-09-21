@@ -21,22 +21,6 @@ extern "C"
 #define GPIO_KNOB_B (GPIO_NUM_46)
 #define KNOB_NUM (GPIO_NUM_45)
 
-    /* i2s codec*/
-
-#define I2S_NUM (I2S_NUM_0)
-
-#define I2S_MCK_IO (GPIO_NUM_1)
-#define I2S_WS_IO (GPIO_NUM_2)
-#define I2S_BCK_IO (GPIO_NUM_3)
-#define I2S_DO_IO (GPIO_NUM_4)
-#define I2S_DI_IO (GPIO_NUM_5)
-
-    /* nau8828 */
-
-#define NAU8822_CS_PIN (GPIO_NUM_20)
-#define NAU8822_SPI_CLK_PIN (GPIO_NUM_32)
-#define NAU8822_SPI_DAT_PIN (GPIO_NUM_33)
-
 /* msi001 */
 #define msi001_dat_pin (GPIO_NUM_33)
 #define msi001_clk_pin (GPIO_NUM_32)

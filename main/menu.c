@@ -17,13 +17,12 @@
 #include "sdr.h"
 #include "ui.h"
 #include "agc.h"
-#include "nau8822.h"
+#include "audio_out.h"
 #include "smeter.h"
 #include "math.h"
 
 #include "lvgl.h"
 
-#include "nau8822.h"
 #include "rtl_source.h"
 
 #include "menu.h"
@@ -48,9 +47,8 @@ extern char *agc_texto[6];
 /* =========================================================
  * VARIABLES DE LA APLICACIÓN
  * ========================================================= */
-static int32_t var_slider1 = 0x20;
+static int32_t var_slider1 = 50; /* output volume, percent */
 static int32_t var_slider2 = 30; /* RTL tuner gain, dB */
-static int32_t var_slider3 = 31;
 static int32_t var_slider4 = 5;
 
 static bool var_btn1 = false;
@@ -69,7 +67,6 @@ static bool var_btn12 = false;
 /* Labels para mostrar valores de sliders */
 static lv_obj_t *lbl_s1;
 static lv_obj_t *lbl_s2;
-static lv_obj_t *lbl_s3;
 static lv_obj_t *lbl_s4;
 
 /* ===== Objetos LVGL del menú (separados) ===== */
@@ -77,9 +74,6 @@ static lv_obj_t *cont_menu = NULL; /* contenedor principal */
 static lv_obj_t *menu_scr = NULL;  /* pantalla activa cuando se crea el menú */
 
 static lv_obj_t *row_sliders = NULL;
-static lv_obj_t *row_mode = NULL;
-static lv_obj_t *lbl_mode = NULL;
-static lv_obj_t *dd_mode = NULL;
 static lv_obj_t *grid_btns = NULL;
 
 /* Bloques/Sliders */
@@ -87,8 +81,6 @@ static lv_obj_t *box_s1 = NULL;
 static lv_obj_t *sl_s1 = NULL;
 static lv_obj_t *box_s2 = NULL;
 static lv_obj_t *sl_s2 = NULL;
-static lv_obj_t *box_s3 = NULL;
-static lv_obj_t *sl_s3 = NULL;
 static lv_obj_t *box_s4 = NULL;
 static lv_obj_t *sl_s4 = NULL;
 
@@ -106,8 +98,6 @@ static lv_obj_t *btn10 = NULL;
 static lv_obj_t *btn11 = NULL;
 static lv_obj_t *btn12_close = NULL;
 
-static uint8_t var_mode = 0; /* 0..9 */
-
 void inicia_timers(void)
 {
     /* Evita crear timers duplicados (causa típica de ralentización) */
@@ -122,52 +112,6 @@ void inicia_timers(void)
         lv_timer_resume(timer_smeter);
 }
 
-static void mode_dd_cb(lv_event_t *e)
-{
-    if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED)
-        return;
-
-    lv_obj_t *dd = lv_event_get_target(e);
-    uint16_t idx = lv_dropdown_get_selected(dd);
-    var_mode = (uint8_t)idx;
-
-    switch (idx)
-    {
-    case 0: /* opcion 0 */
-        nau8822_init(0);
-        break;
-    case 1: /* opcion 1 */
-        nau8822_init(1);
-        break;
-    case 2: /* opcion 2 */
-        nau8822_init(2);
-        break;
-    case 3: /* opcion 3 */
-        nau8822_init(3);
-        break;
-    case 4: /* opcion 4 */
-        nau8822_init(4);
-        break;
-    case 5: /* opcion 5 */
-        nau8822_init(5);
-        break;
-    case 6: /* opcion 6 */
-        nau8822_init(6);
-        break;
-    case 7: /* opcion 7 */
-        nau8822_init(7);
-        break;
-    case 8: /* opcion 8 */
-        nau8822_init(8);
-        break;
-    case 9: /* opcion 9 */
-        nau8822_init(9);
-        break;
-    default:
-        break;
-    }
-}
-
 /* =========================================================
  * CALLBACKS SLIDERS
  * ========================================================= */
@@ -180,7 +124,7 @@ static void slicer_dac_volume(lv_event_t *e)
     var_slider1 = lv_slider_get_value(sl);
     lv_label_set_text_fmt(lbl_s1, "Slider 1: %ld", (long)var_slider1);
 
-    nau8822_spk_volume(var_slider1);
+    audio_out_set_volume((int)var_slider1);
 }
 
 static void slider_rtl_gain(lv_event_t *e)
@@ -193,18 +137,6 @@ static void slider_rtl_gain(lv_event_t *e)
     lv_label_set_text_fmt(lbl_s2, "Slider 2: %ld", (long)var_slider2);
 
     rtl_source_set_gain_db(var_slider2);
-}
-
-static void slider_adc_volume(lv_event_t *e)
-{
-    if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED)
-        return;
-    lv_obj_t *sl = lv_event_get_target(e);
-
-    var_slider3 = lv_slider_get_value(sl);
-    lv_label_set_text_fmt(lbl_s3, "Slider 3: %ld", (long)var_slider3);
-
-    nau8822_dac_gain(var_slider3);
 }
 
 static void slider_brightness(lv_event_t *e)
@@ -350,18 +282,14 @@ static void btn12_cb(lv_event_t *e)
         /* Limpia referencias para evitar punteros colgantes */
         menu_scr = NULL;
         row_sliders = NULL;
-        row_mode = NULL;
-        lbl_mode = NULL;
-        dd_mode = NULL;
         grid_btns = NULL;
 
         box_s1 = sl_s1 = NULL;
         box_s2 = sl_s2 = NULL;
-        box_s3 = sl_s3 = NULL;
         box_s4 = sl_s4 = NULL;
 
         /* Labels quedan invalidados al borrar cont_menu, pero los punteros se limpian igualmente */
-        lbl_s1 = lbl_s2 = lbl_s3 = lbl_s4 = NULL;
+        lbl_s1 = lbl_s2 = lbl_s4 = NULL;
 
         btn1_usb = btn2_lsb = btn3_am = btn4_sam = NULL;
         btn5_samu = btn6_saml = btn7_nr = btn8_filtro = NULL;
@@ -471,41 +399,12 @@ void ui_create_control_panel(void)
                           LV_FLEX_ALIGN_CENTER,
                           LV_FLEX_ALIGN_CENTER);
 
-    create_slider_block(row_sliders, "Volume", 0, 64,
+    create_slider_block(row_sliders, "Volume", 0, 100,
                         var_slider1, slicer_dac_volume, &box_s1, &sl_s1, &lbl_s1);
     create_slider_block(row_sliders, "RTL gain", 0, 50,
                         var_slider2, slider_rtl_gain, &box_s2, &sl_s2, &lbl_s2);
-    create_slider_block(row_sliders, "DAC gain", 0, 63,
-                        var_slider3, slider_adc_volume, &box_s3, &sl_s3, &lbl_s3);
     create_slider_block(row_sliders, "Brightness", 1, 200,
                         var_slider4, slider_brightness, &box_s4, &sl_s4, &lbl_s4);
-
-    /* --- Control 10 valores (Dropdown) --- */
-    row_mode = lv_obj_create(cont_menu);
-    lv_obj_set_width(row_mode, lv_pct(100));
-    lv_obj_set_height(row_mode, 60);
-    lv_obj_set_style_pad_all(row_mode, 0, 0);
-    lv_obj_set_style_border_width(row_mode, 0, 0);
-    lv_obj_set_flex_flow(row_mode, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(row_mode, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lbl_mode = lv_label_create(row_mode);
-    lv_label_set_text(lbl_mode, "NAU8822:");
-    dd_mode = lv_dropdown_create(row_mode);
-    lv_dropdown_set_options_static(dd_mode,
-                            "Opcion 0\n"
-                            "Opcion 1\n"
-                            "Opcion 2\n"
-                            "Opcion 3\n"
-                            "Opcion 4\n"
-                            "Opcion 5\n"
-                            "Opcion 6\n"
-                            "LIN RIN \n"
-                            "MICR MICL\n"
-                            "Opcion 9");
-    lv_dropdown_set_selected(dd_mode, var_mode);
-    lv_obj_set_width(dd_mode, 220);
-
-    lv_obj_add_event_cb(dd_mode, mode_dd_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
     /* ---------- Botonera (2 filas x 6 botones) ---------- */
     grid_btns = lv_obj_create(cont_menu);

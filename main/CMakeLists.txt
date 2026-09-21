@@ -3,8 +3,7 @@ set(INCLUDE_DIR ./include)
 idf_component_register(
     SRCS 
     main.c
-    i2s_driver.c
-    nau8822.c
+    audio_out.c
     sdr.c
     agc.c
     nr.c
