@@ -1,0 +1,18 @@
+{
+  "idf.port": "/dev/ttyACM0",
+  "idf.flashType": "JTAG",
+  "idf.currentSetup": "/home/gmtii/.espressif/v6.0/esp-idf",
+  "idf.customExtraVars": {
+    "IDF_TARGET": "esp32p4",
+    "OPENOCD_USB_ADAPTER_LOCATION": "1-4"
+  },
+  "clangd.path": "/home/gmtii/.espressif/tools/esp-clang/esp-19.1.2_20250312/esp-clang/bin/clangd",
+  "clangd.arguments": [
+    "--background-index",
+    "--query-driver=**",
+    "--compile-commands-dir=/home/gmtii/git/ESP32P4-JC1060P470CIWY-SDR-iberico/build"
+  ],
+  "idf.openOcdConfigs": [
+    "board/esp32p4-builtin.cfg"
+  ]
+}

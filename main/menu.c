@@ -1,0 +1,677 @@
+#include <stdint.h>
+#include <stdbool.h>
+#include <string.h>
+#include "esp_system.h"
+#include "esp_log.h"
+#include "esp_err.h"
+#include "esp_check.h"
+#include "driver/gpio.h"
+
+#include "lvgl.h"
+#include "esp_lvgl_port.h"
+
+#include "bsp/esp-bsp.h"
+#include "bsp/display.h"
+#include "bsp_board_extra.h"
+
+#include "sdr.h"
+#include "ui.h"
+#include "agc.h"
+#include "nau8822.h"
+#include "smeter.h"
+#include "math.h"
+
+#include "lvgl.h"
+
+#include "nau8822.h"
+#include "msi001.h"
+
+#include "menu.h"
+
+#include "lvgl.h"
+#include <stdio.h>
+#include <stdbool.h>
+
+extern int demod_modo;
+extern int f_nrss;
+extern agc_wdsp_params_t agc_wdsp_conf;
+extern bool screen_update;
+
+extern int pasos[6];
+extern int pasos_indice;
+
+extern bool f_actualiza;
+extern int filtro_indice;
+extern char *filtros_texto[5];
+extern char *agc_texto[6];
+
+/* =========================================================
+ * VARIABLES DE LA APLICACIÓN
+ * ========================================================= */
+static int32_t var_slider1 = 0x20;
+static int32_t var_slider2 = 43;
+static int32_t var_slider3 = 31;
+static int32_t var_slider4 = 5;
+
+static bool var_btn1 = false;
+static bool var_btn2 = false;
+static bool var_btn3 = false;
+static bool var_btn4 = false;
+static bool var_btn5 = false;
+static bool var_btn6 = false;
+static bool var_btn7 = false;
+static bool var_btn8 = false;
+static bool var_btn9 = false;
+static bool var_btn10 = false;
+static bool var_btn11 = false;
+static bool var_btn12 = false;
+
+/* Labels para mostrar valores de sliders */
+static lv_obj_t *lbl_s1;
+static lv_obj_t *lbl_s2;
+static lv_obj_t *lbl_s3;
+static lv_obj_t *lbl_s4;
+
+/* ===== Objetos LVGL del menú (separados) ===== */
+static lv_obj_t *cont_menu = NULL; /* contenedor principal */
+static lv_obj_t *menu_scr = NULL;  /* pantalla activa cuando se crea el menú */
+
+static lv_obj_t *row_sliders = NULL;
+static lv_obj_t *row_mode = NULL;
+static lv_obj_t *lbl_mode = NULL;
+static lv_obj_t *dd_mode = NULL;
+static lv_obj_t *grid_btns = NULL;
+
+/* Bloques/Sliders */
+static lv_obj_t *box_s1 = NULL;
+static lv_obj_t *sl_s1 = NULL;
+static lv_obj_t *box_s2 = NULL;
+static lv_obj_t *sl_s2 = NULL;
+static lv_obj_t *box_s3 = NULL;
+static lv_obj_t *sl_s3 = NULL;
+static lv_obj_t *box_s4 = NULL;
+static lv_obj_t *sl_s4 = NULL;
+
+/* Botones (si necesitas manipularlos después) */
+static lv_obj_t *btn1_usb = NULL;
+static lv_obj_t *btn2_lsb = NULL;
+static lv_obj_t *btn3_am = NULL;
+static lv_obj_t *btn4_sam = NULL;
+static lv_obj_t *btn5_samu = NULL;
+static lv_obj_t *btn6_saml = NULL;
+static lv_obj_t *btn7_nr = NULL;
+static lv_obj_t *btn8_filtro = NULL;
+static lv_obj_t *btn9_agc = NULL;
+static lv_obj_t *btn10 = NULL;
+static lv_obj_t *btn11 = NULL;
+static lv_obj_t *btn12_close = NULL;
+
+static uint8_t var_mode = 0; /* 0..9 */
+
+void inicia_timers(void)
+{
+    /* Evita crear timers duplicados (causa típica de ralentización) */
+    if (!timer_pantalla)
+        timer_pantalla = lv_timer_create(timer_dibuja_pantalla, 33, NULL);
+    else
+        lv_timer_resume(timer_pantalla);
+
+    if (!timer_smeter)
+        timer_smeter = lv_timer_create(timer_smeter_update, 33, NULL);
+    else
+        lv_timer_resume(timer_smeter);
+}
+
+static void mode_dd_cb(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED)
+        return;
+
+    lv_obj_t *dd = lv_event_get_target(e);
+    uint16_t idx = lv_dropdown_get_selected(dd);
+    var_mode = (uint8_t)idx;
+
+    switch (idx)
+    {
+    case 0: /* opcion 0 */
+        nau8822_init(0);
+        break;
+    case 1: /* opcion 1 */
+        nau8822_init(1);
+        break;
+    case 2: /* opcion 2 */
+        nau8822_init(2);
+        break;
+    case 3: /* opcion 3 */
+        nau8822_init(3);
+        break;
+    case 4: /* opcion 4 */
+        nau8822_init(4);
+        break;
+    case 5: /* opcion 5 */
+        nau8822_init(5);
+        break;
+    case 6: /* opcion 6 */
+        nau8822_init(6);
+        break;
+    case 7: /* opcion 7 */
+        nau8822_init(7);
+        break;
+    case 8: /* opcion 8 */
+        nau8822_init(8);
+        break;
+    case 9: /* opcion 9 */
+        nau8822_init(9);
+        break;
+    default:
+        break;
+    }
+}
+
+/* =========================================================
+ * CALLBACKS SLIDERS
+ * ========================================================= */
+static void slicer_dac_volume(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED)
+        return;
+    lv_obj_t *sl = lv_event_get_target(e);
+
+    var_slider1 = lv_slider_get_value(sl);
+    lv_label_set_text_fmt(lbl_s1, "Slider 1: %ld", (long)var_slider1);
+
+    nau8822_spk_volume(var_slider1);
+}
+
+static void slider_msi_gain(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED)
+        return;
+    lv_obj_t *sl = lv_event_get_target(e);
+
+    var_slider2 = lv_slider_get_value(sl);
+    lv_label_set_text_fmt(lbl_s2, "Slider 2: %ld", (long)var_slider2);
+
+    mirisdr_set_tuner_gain(var_slider2);
+}
+
+static void slider_adc_volume(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED)
+        return;
+    lv_obj_t *sl = lv_event_get_target(e);
+
+    var_slider3 = lv_slider_get_value(sl);
+    lv_label_set_text_fmt(lbl_s3, "Slider 3: %ld", (long)var_slider3);
+
+    nau8822_dac_gain(var_slider3);
+}
+
+static void slider_brightness(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED)
+        return;
+    lv_obj_t *sl = lv_event_get_target(e);
+
+    var_slider4 = lv_slider_get_value(sl);
+    lv_label_set_text_fmt(lbl_s4, "Slider 4: %ld", (long)var_slider4);
+
+    bsp_display_brightness_set(var_slider4);
+
+    // hw_set_param3(var_slider3);
+}
+
+/* =========================================================
+ * CALLBACKS BOTONES
+ * ========================================================= */
+static void btn1_cb(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED)
+        return;
+    var_btn1 = !var_btn1;
+    demod_modo = DEMOD_USB;
+    dibuja_pasabanda();
+}
+
+static void btn2_cb(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED)
+        return;
+    var_btn2 = !var_btn2;
+    demod_modo = DEMOD_LSB;
+    dibuja_pasabanda();
+}
+
+static void btn3_cb(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED)
+        return;
+    var_btn3 = !var_btn3;
+    demod_modo = DEMOD_AM;
+    dibuja_pasabanda();
+}
+
+static void btn4_cb(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED)
+        return;
+    var_btn4 = !var_btn4;
+    demod_modo = DEMOD_SAM;
+    dibuja_pasabanda();
+}
+
+static void btn5_cb(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED)
+        return;
+    var_btn5 = !var_btn5;
+    demod_modo = DEMOD_SAMU;
+    dibuja_pasabanda();
+}
+
+static void btn6_cb(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED)
+        return;
+    var_btn6 = !var_btn6;
+    demod_modo = DEMOD_SAML;
+    dibuja_pasabanda();
+}
+
+static void btn7_cb(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED)
+        return;
+    var_btn7 = !var_btn7;
+
+    if (!f_nrss)
+        f_nrss = true;
+    else
+        f_nrss = false;
+}
+
+static void btn8_cb(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED)
+        return;
+    var_btn8 = !var_btn8;
+    filtro_indice++;
+    if (filtro_indice > 4)
+        filtro_indice = 0;
+    f_actualiza = true;
+    dibuja_pasabanda();
+}
+
+static void btn9_cb(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED)
+        return;
+    var_btn9 = !var_btn9;
+
+    agc_wdsp_conf.AGC_mode++;
+    if (agc_wdsp_conf.AGC_mode > 5)
+        agc_wdsp_conf.AGC_mode = 0;
+
+    agc_wdsp_conf.agc_switch_mode = 1;
+    AGC_prep();
+}
+
+static void btn10_cb(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED)
+        return;
+    var_btn10 = !var_btn10;
+    printf("BTN10 -> %d\n", var_btn10);
+}
+
+static void btn11_cb(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED)
+        return;
+    var_btn11 = !var_btn11;
+    printf("BTN11 -> %d\n", var_btn11);
+}
+
+/* =========================================================
+ * BOTÓN CERRAR (DESTRUYE EL MENÚ)
+ * ========================================================= */
+
+static void btn12_cb(lv_event_t *e)
+{
+
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED)
+        return;
+
+    if (cont_menu && lv_obj_is_valid(cont_menu)) {
+        lv_obj_del_async(cont_menu); 
+
+        cont_menu = NULL;
+
+        /* Limpia referencias para evitar punteros colgantes */
+        menu_scr = NULL;
+        row_sliders = NULL;
+        row_mode = NULL;
+        lbl_mode = NULL;
+        dd_mode = NULL;
+        grid_btns = NULL;
+
+        box_s1 = sl_s1 = NULL;
+        box_s2 = sl_s2 = NULL;
+        box_s3 = sl_s3 = NULL;
+        box_s4 = sl_s4 = NULL;
+
+        /* Labels quedan invalidados al borrar cont_menu, pero los punteros se limpian igualmente */
+        lbl_s1 = lbl_s2 = lbl_s3 = lbl_s4 = NULL;
+
+        btn1_usb = btn2_lsb = btn3_am = btn4_sam = NULL;
+        btn5_samu = btn6_saml = btn7_nr = btn8_filtro = NULL;
+        btn9_agc = btn10 = btn11 = btn12_close = NULL;
+
+        inicia_timers();
+        refresca_indicadores();
+    }
+}
+
+/* =========================================================
+ * HELPERS UI
+ * ========================================================= */
+static void create_slider_block(lv_obj_t *parent,
+                                const char *title,
+                                int32_t min, int32_t max, int32_t init,
+                                lv_event_cb_t cb,
+                                lv_obj_t **out_box,
+                                lv_obj_t **out_slider,
+                                lv_obj_t **out_label)
+{
+    lv_obj_t *box = lv_obj_create(parent);
+    lv_obj_set_size(box, 225, 120);
+    lv_obj_set_style_pad_all(box, 12, 0);
+    lv_obj_set_flex_flow(box, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(box,
+                          LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+
+    lv_obj_t *t = lv_label_create(box);
+    lv_label_set_text(t, title);
+
+    lv_obj_t *sl = lv_slider_create(box);
+    lv_obj_set_width(sl, lv_pct(100));
+    lv_slider_set_range(sl, min, max);
+    lv_slider_set_value(sl, init, LV_ANIM_OFF);
+    lv_obj_add_event_cb(sl, cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    lv_obj_t *val = lv_label_create(box);
+    lv_label_set_text_fmt(val, "Slider: %ld", (long)init);
+
+    if (out_box)
+        *out_box = box;
+    if (out_slider)
+        *out_slider = sl;
+    if (out_label)
+        *out_label = val;
+}
+
+static lv_obj_t *create_button(lv_obj_t *parent,
+                               const char *txt,
+                               lv_event_cb_t cb)
+{
+    lv_obj_t *btn = lv_btn_create(parent);
+    lv_obj_set_size(btn, 140, 60);
+    lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_set_style_bg_color(btn, lv_color_hex(0x202020), LV_PART_MAIN);
+    lv_obj_set_style_border_color(btn, lv_color_hex(0x404040), LV_PART_MAIN);
+
+    lv_obj_t *lbl = lv_label_create(btn);
+    lv_label_set_text(lbl, txt);
+    lv_obj_center(lbl);
+
+    return btn;
+}
+
+/* =========================================================
+ * FUNCIÓN PRINCIPAL PARA CREAR EL MENÚ
+ * ========================================================= */
+void ui_create_control_panel(void)
+{
+    if (cont_menu)
+        return; /* evita crear dos veces */
+
+    menu_scr = lv_scr_act();
+
+    /* ---------- Contenedor principal ---------- */
+    cont_menu = lv_obj_create(menu_scr);
+    lv_obj_set_size(cont_menu, 1024, 500);
+    lv_obj_center(cont_menu);
+    lv_obj_set_style_pad_all(cont_menu, 16, 0);
+
+    lv_obj_set_style_bg_color(cont_menu, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(cont_menu, LV_OPA_COVER, 0);
+
+    lv_obj_remove_flag(cont_menu, LV_OBJ_FLAG_SCROLLABLE);
+
+    /* ---------- Layout general ---------- */
+    lv_obj_set_flex_flow(cont_menu, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(cont_menu,
+                          LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_START);
+
+    /* ---------- Fila de sliders ---------- */
+    row_sliders = lv_obj_create(cont_menu);
+    lv_obj_set_width(row_sliders, lv_pct(100));
+    lv_obj_set_height(row_sliders, 190);
+    lv_obj_set_style_pad_all(row_sliders, 0, 0);
+    lv_obj_set_style_border_width(row_sliders, 0, 0);
+
+    lv_obj_set_flex_flow(row_sliders, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row_sliders,
+                          LV_FLEX_ALIGN_SPACE_EVENLY,
+                          LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+
+    create_slider_block(row_sliders, "Volume", 0, 64,
+                        var_slider1, slicer_dac_volume, &box_s1, &sl_s1, &lbl_s1);
+    create_slider_block(row_sliders, "MSI gain", 0, 90,
+                        var_slider2, slider_msi_gain, &box_s2, &sl_s2, &lbl_s2);
+    create_slider_block(row_sliders, "DAC gain", 0, 63,
+                        var_slider3, slider_adc_volume, &box_s3, &sl_s3, &lbl_s3);
+    create_slider_block(row_sliders, "Brightness", 1, 200,
+                        var_slider4, slider_brightness, &box_s4, &sl_s4, &lbl_s4);
+
+    /* --- Control 10 valores (Dropdown) --- */
+    row_mode = lv_obj_create(cont_menu);
+    lv_obj_set_width(row_mode, lv_pct(100));
+    lv_obj_set_height(row_mode, 60);
+    lv_obj_set_style_pad_all(row_mode, 0, 0);
+    lv_obj_set_style_border_width(row_mode, 0, 0);
+    lv_obj_set_flex_flow(row_mode, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row_mode, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lbl_mode = lv_label_create(row_mode);
+    lv_label_set_text(lbl_mode, "NAU8822:");
+    dd_mode = lv_dropdown_create(row_mode);
+    lv_dropdown_set_options_static(dd_mode,
+                            "Opcion 0\n"
+                            "Opcion 1\n"
+                            "Opcion 2\n"
+                            "Opcion 3\n"
+                            "Opcion 4\n"
+                            "Opcion 5\n"
+                            "Opcion 6\n"
+                            "LIN RIN \n"
+                            "MICR MICL\n"
+                            "Opcion 9");
+    lv_dropdown_set_selected(dd_mode, var_mode);
+    lv_obj_set_width(dd_mode, 220);
+
+    lv_obj_add_event_cb(dd_mode, mode_dd_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    /* ---------- Botonera (2 filas x 6 botones) ---------- */
+    grid_btns = lv_obj_create(cont_menu);
+    lv_obj_set_width(grid_btns, lv_pct(100));
+    lv_obj_set_height(grid_btns, 200);
+    lv_obj_set_style_pad_all(grid_btns, 0, 0);
+    lv_obj_set_style_border_width(grid_btns, 0, 0);
+
+    /* Flex: filas con wrap */
+    lv_obj_set_flex_flow(grid_btns, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_flex_align(grid_btns,
+                          LV_FLEX_ALIGN_SPACE_EVENLY,
+                          LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+
+    /* Espacio vertical entre filas */
+    btn1_usb = create_button(grid_btns, "USB", btn1_cb);
+    btn2_lsb = create_button(grid_btns, "LSB", btn2_cb);
+    btn3_am = create_button(grid_btns, "AM", btn3_cb);
+    btn4_sam = create_button(grid_btns, "SAM", btn4_cb);
+    btn5_samu = create_button(grid_btns, "SAMU", btn5_cb);
+    btn6_saml = create_button(grid_btns, "SAML", btn6_cb);
+
+    btn7_nr = create_button(grid_btns, "NR", btn7_cb);
+    btn8_filtro = create_button(grid_btns, "FILTRO", btn8_cb);
+    btn9_agc = create_button(grid_btns, "AGC", btn9_cb);
+    btn10 = create_button(grid_btns, "BTN 10", btn10_cb);
+    btn11 = create_button(grid_btns, "BTN 11", btn11_cb);
+    btn12_close = create_button(grid_btns, LV_SYMBOL_CLOSE, btn12_cb);
+}
+
+/* ------------------------------------------------------------------------------- */
+/* ------------------------------------------------------------------------------- */
+/* ------------------------------------------------------------------------------- */
+/* ------------------------------------------------------------------------------- */
+/* ------------------------------------------------------------------------------- */
+/* ------------------------------------------------------------------------------- */
+/* ------------------------------------------------------------------------------- */
+
+static lv_obj_t *freq_popup = NULL;
+static lv_obj_t *ta_freq = NULL;
+static lv_obj_t *btnm_freq = NULL;
+
+static uint32_t parse_freq(const char *s, double mul)
+{
+    char *end;
+    double v = strtod(s, &end);
+    if (end == s || v <= 0)
+        return 0;
+    return (uint32_t)(v * mul + 0.5);
+}
+
+static void freq_popup_close(void)
+{
+    if (freq_popup)
+    {
+        lv_obj_del(freq_popup);
+        freq_popup = NULL;
+        ta_freq = NULL;
+        btnm_freq = NULL;
+    }
+}
+
+static void freq_btnm_event_cb(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED)
+        return;
+
+    const char *txt = lv_btnmatrix_get_btn_text(
+        lv_event_get_target(e),
+        lv_btnmatrix_get_selected_btn(lv_event_get_target(e)));
+
+    if (!txt)
+        return;
+
+    if (strcmp(txt, LV_SYMBOL_LEFT) == 0)
+    {
+        lv_textarea_delete_char(ta_freq);
+        return;
+    }
+
+    if (strcmp(txt, "kHz") == 0 || strcmp(txt, "MHz") == 0)
+    {
+        double mul = (txt[0] == 'k') ? 1e3 : 1e6;
+        uint32_t hz = parse_freq(lv_textarea_get_text(ta_freq), mul);
+        if (hz)
+        {
+            currentVFO.Frec = hz;
+            refresca_VFO();
+            mirisdr_set_center_freq(currentVFO.Frec - 12000);
+        }
+        return;
+    }
+
+    if (strcmp(txt, LV_SYMBOL_OK) == 0)
+    {
+        uint32_t hz = parse_freq(lv_textarea_get_text(ta_freq), 1e6);
+        if (hz)
+            currentVFO.Frec = hz;
+        refresca_VFO();
+        mirisdr_set_center_freq(currentVFO.Frec - 12000);
+        freq_popup_close();
+
+        inicia_timers();
+
+        return;
+    }
+
+    /* dígitos y punto */
+    if ((txt[0] >= '0' && txt[0] <= '9' && txt[1] == '\0') || strcmp(txt, ".") == 0)
+    {
+        if (strcmp(txt, ".") == 0)
+        {
+            const char *s = lv_textarea_get_text(ta_freq);
+            if (strchr(s, '.'))
+                return;
+            if (!s[0])
+                lv_textarea_add_text(ta_freq, "0");
+        }
+        lv_textarea_add_text(ta_freq, txt);
+    }
+}
+
+void freq_label_event_cb(lv_event_t *e)
+{
+    if (freq_popup)
+        return;
+
+    if (timer_pantalla)
+        lv_timer_pause(timer_pantalla);
+    if (timer_smeter)
+        lv_timer_pause(timer_smeter);
+
+    freq_popup = lv_obj_create(lv_scr_act());
+    lv_obj_set_size(freq_popup, 520, 300);
+    lv_obj_center(freq_popup);
+    lv_obj_set_style_pad_all(freq_popup, 12, 0);
+
+    lv_obj_set_style_bg_color(freq_popup, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(freq_popup, LV_OPA_COVER, 0);
+
+    ta_freq = lv_textarea_create(freq_popup);
+    lv_obj_set_width(ta_freq, lv_pct(100));
+    lv_textarea_set_one_line(ta_freq, true);
+
+    lv_textarea_set_text(ta_freq, "");
+
+    static const char *map[] = {
+        "7", "8", "9", LV_SYMBOL_LEFT, "\n",
+        "4", "5", "6", "kHz", "\n",
+        "1", "2", "3", "MHz", "\n",
+        "0", ".", LV_SYMBOL_OK, ""};
+
+    btnm_freq = lv_btnmatrix_create(freq_popup);
+    lv_btnmatrix_set_map(btnm_freq, map);
+    lv_obj_set_size(btnm_freq, lv_pct(100), 220);
+    lv_obj_align(btnm_freq, LV_ALIGN_BOTTOM_MID, 0, 0);
+
+    lv_obj_add_event_cb(btnm_freq, freq_btnm_event_cb,
+                        LV_EVENT_VALUE_CHANGED, NULL);
+}
+
+/* ------------------------------------------------------------------------------- */
+/* ------------------------------------------------------------------------------- */
+/* ------------------------------------------------------------------------------- */
+/* ------------------------------------------------------------------------------- */
+/* ------------------------------------------------------------------------------- */
+/* ------------------------------------------------------------------------------- */
+/* ------------------------------------------------------------------------------- */
