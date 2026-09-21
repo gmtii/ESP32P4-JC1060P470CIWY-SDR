@@ -1,0 +1,389 @@
+/*
+ * rtl_source.c - glue between esp_rtl_sdr (USB Host) and the receiver DSP.
+ *
+ *   USB block (CU8 @ 960 kSps, delivery task, callback mode)
+ *        |  rtl_dsp_process(): CIC -> drift resampler -> FIR    (rtl_dsp.c)
+ *        v
+ *   SPSC ring of int16 I/Q frames @ 48 kSps
+ *        |  rtl_source_read_float(): SDR task, paced by the codec's I2S TX
+ *        v
+ *   sdr.c
+ *
+ * The dongle and the codec run from different crystals. The consumer measures
+ * the ring level once per block and steers the resampler step so the level
+ * stays constant (see rtl_dsp.h). No samples are ever dropped or repeated in
+ * normal operation.
+ */
+#include "rtl_source.h"
+
+#include <string.h>
+
+#include "esp_log.h"
+#include "esp_timer.h"
+#include "esp_heap_caps.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+#include "esp_rtl_sdr.h"
+#include "rtl_dsp.h"
+
+static const char *TAG = "rtl_source";
+
+#define RING_FRAMES       8192u                     /* power of two, ~170 ms          */
+#define RING_MASK         (RING_FRAMES - 1u)
+#define HIGH_WATER_FRAMES 6144u                     /* above this the consumer skips  */
+#define CHUNK_BYTES       4096u                     /* DSP works in chunks of this size */
+#define OUT_CHUNK_FRAMES  128u                      /* >= RTL_DSP_MAX_FRAMES(CHUNK_BYTES) */
+
+typedef struct { int16_t i, q; } iq16_t;
+
+static struct {
+    esp_rtl_sdr_handle_t sdr;
+    rtl_dsp_t dsp;                                  /* owned by the delivery task     */
+    rtl_rate_ctl_t rc;                              /* owned by the SDR task          */
+    volatile float step_req;                        /* SDR task -> delivery task      */
+
+    iq16_t *ring;
+    uint32_t head;                                  /* written by delivery task       */
+    uint32_t tail;                                  /* written by SDR task            */
+    uint32_t arr_seq;                               /* seqlock for (head, arr_t_us)   */
+    int64_t  arr_t_us;                              /* time the last block was pushed */
+    volatile bool primed;
+
+    volatile TaskHandle_t reader;
+    volatile TaskHandle_t ctl;
+
+    volatile bool streaming;
+    volatile bool fault;
+
+    volatile uint32_t want_lo_hz;
+    volatile bool     lo_pending;
+    volatile int      want_gain_db;
+    volatile bool     want_gain_auto;
+    volatile bool     gain_pending;
+
+    uint32_t fifo_overruns, underruns, skipped;
+} S;
+
+/* ------------------------------------------------------------------------- */
+/* Delivery-task side                                                        */
+/* ------------------------------------------------------------------------- */
+
+static void process_block(const uint8_t *data, size_t bytes)
+{
+    int16_t out[2 * OUT_CHUNK_FRAMES];
+
+    rtl_dsp_set_step(&S.dsp, S.step_req);
+
+    uint32_t head = S.head;
+    const uint32_t tail = __atomic_load_n(&S.tail, __ATOMIC_ACQUIRE);
+
+    for (size_t off = 0; off < bytes; off += CHUNK_BYTES) {
+        size_t n = bytes - off;
+        if (n > CHUNK_BYTES) n = CHUNK_BYTES;
+        const size_t nf = rtl_dsp_process(&S.dsp, data + off, n, out, OUT_CHUNK_FRAMES);
+        const uint32_t space = RING_FRAMES - (head - tail);
+        if (nf > space) {
+            S.fifo_overruns += (uint32_t)nf;
+            continue;
+        }
+        for (size_t k = 0; k < nf; k++) {
+            S.ring[(head + k) & RING_MASK] = (iq16_t){ out[2 * k], out[2 * k + 1] };
+        }
+        head += (uint32_t)nf;
+    }
+
+    /* Publish head together with its arrival time (seqlock, single writer) */
+    const uint32_t s = S.arr_seq;
+    __atomic_store_n(&S.arr_seq, s + 1, __ATOMIC_RELAXED);
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    S.arr_t_us = esp_timer_get_time();
+    __atomic_store_n(&S.head, head, __ATOMIC_RELEASE);
+    __atomic_store_n(&S.arr_seq, s + 2, __ATOMIC_RELEASE);
+
+    TaskHandle_t r = S.reader;
+    if (r != NULL) {
+        xTaskNotifyGive(r);
+    }
+}
+
+static void on_event(esp_rtl_sdr_event_t ev, const void *payload, void *ctx)
+{
+    (void)ctx;
+    switch (ev) {
+    case ESP_RTL_SDR_EVT_IQ_BLOCK: {
+        const esp_rtl_sdr_iq_block_t *b = (const esp_rtl_sdr_iq_block_t *)payload;
+        process_block(b->data, b->bytes);
+        break;
+    }
+    case ESP_RTL_SDR_EVT_DISCONNECTED:
+    case ESP_RTL_SDR_EVT_ERROR:
+        S.fault = true;
+        if (S.ctl != NULL) {
+            xTaskNotifyGive(S.ctl);
+        }
+        break;
+    default:
+        break;
+    }
+}
+
+/* ------------------------------------------------------------------------- */
+/* Control task: install / start / retune / gain / recovery                  */
+/* ------------------------------------------------------------------------- */
+
+static void apply_gain(void)
+{
+    esp_err_t err;
+    if (S.want_gain_auto) {
+        err = esp_rtl_sdr_set_tuner_gain_mode(S.sdr, ESP_RTL_SDR_GAIN_MODE_AUTO);
+    } else {
+        err = esp_rtl_sdr_set_tuner_gain(S.sdr, S.want_gain_db * 10);
+    }
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "gain request failed: %s", esp_rtl_sdr_err_to_name(err));
+    }
+}
+
+static bool start_stream(void)
+{
+    size_t count = 0;
+    (void)esp_rtl_sdr_refresh_device_list(S.sdr);
+    (void)esp_rtl_sdr_get_device_count(S.sdr, &count);
+    if (count == 0) {
+        return false;
+    }
+
+    rtl_dsp_init(&S.dsp, RTL_SOURCE_CONJUGATE_IQ != 0);
+    S.step_req = 1.0f;
+    S.primed = false;
+
+    /* Clear the flags first, then read the values: a request that lands in between is not lost */
+    (void)__atomic_exchange_n(&S.lo_pending, false, __ATOMIC_ACQUIRE);
+    (void)__atomic_exchange_n(&S.gain_pending, false, __ATOMIC_ACQUIRE);
+
+    esp_rtl_sdr_stream_config_t st;
+    esp_rtl_sdr_stream_config_default(&st);
+    st.preset = ESP_RTL_SDR_PRESET_CUSTOM_HZ;
+    st.frequency_hz = S.want_lo_hz;
+    st.sample_rate_sps = RTL_DSP_IN_RATE;
+
+    const esp_err_t err = esp_rtl_sdr_start(S.sdr, &st);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "start failed: %s", esp_rtl_sdr_err_to_name(err));
+        return false;
+    }
+    S.fault = false;
+    apply_gain();
+    S.streaming = true;
+    ESP_LOGI(TAG, "streaming, LO %u Hz, %u kSps, caps 0x%08x",
+             (unsigned)st.frequency_hz, (unsigned)(RTL_DSP_IN_RATE / 1000),
+             (unsigned)esp_rtl_sdr_get_device_capabilities(S.sdr));
+    return true;
+}
+
+static void recover(void)
+{
+    S.streaming = false;
+    S.primed = false;
+    ESP_LOGW(TAG, "stream lost, restarting");
+    for (int attempt = 0; attempt < 5; attempt++) {
+        if (esp_rtl_sdr_stop(S.sdr, 1000) == ESP_OK) {
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+    if (esp_rtl_sdr_get_state(S.sdr) == ESP_RTL_SDR_STATE_FAULT) {
+        (void)esp_rtl_sdr_reset(S.sdr);
+    }
+    S.fault = false;
+}
+
+static void ctl_task(void *arg)
+{
+    (void)arg;
+
+    esp_rtl_sdr_config_t cfg;
+    esp_rtl_sdr_config_default(&cfg);
+    cfg.event_cb = on_event;
+    cfg.delivery_mode = ESP_RTL_SDR_DELIVERY_CALLBACK;   /* no pull ring, we keep our own */
+
+    while (esp_rtl_sdr_install(&cfg, &S.sdr) != ESP_OK) {
+        ESP_LOGE(TAG, "esp_rtl_sdr_install failed, retrying");
+        vTaskDelay(pdMS_TO_TICKS(2000));
+    }
+
+    for (;;) {
+        if (!S.streaming) {
+            if (!start_stream()) {
+                ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(500));
+            }
+            continue;
+        }
+
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(250));
+
+        if (S.fault || esp_rtl_sdr_get_state(S.sdr) != ESP_RTL_SDR_STATE_STREAMING) {
+            recover();
+            continue;
+        }
+        if (__atomic_exchange_n(&S.lo_pending, false, __ATOMIC_ACQUIRE)) {
+            const uint32_t lo = S.want_lo_hz;
+            const esp_err_t err = esp_rtl_sdr_retune_hz(S.sdr, lo);
+            if (err != ESP_OK) {
+                ESP_LOGW(TAG, "retune %u Hz failed: %s", (unsigned)lo, esp_rtl_sdr_err_to_name(err));
+            }
+        }
+        if (__atomic_exchange_n(&S.gain_pending, false, __ATOMIC_ACQUIRE)) {
+            apply_gain();
+        }
+    }
+}
+
+/* ------------------------------------------------------------------------- */
+/* Public API                                                                */
+/* ------------------------------------------------------------------------- */
+
+esp_err_t rtl_source_init(uint32_t initial_lo_hz, int initial_gain_db)
+{
+    if (S.ring != NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    S.ring = (iq16_t *)heap_caps_malloc(RING_FRAMES * sizeof(iq16_t), MALLOC_CAP_8BIT);
+    if (S.ring == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    S.want_lo_hz = initial_lo_hz;
+    S.want_gain_db = initial_gain_db;
+    S.want_gain_auto = false;
+    S.step_req = 1.0f;
+    rtl_rate_ctl_reset(&S.rc);
+
+    TaskHandle_t ctl = NULL;
+    if (xTaskCreatePinnedToCore(ctl_task, "rtl_ctl", 8192, NULL, 5, &ctl, 0) != pdPASS) {
+        heap_caps_free(S.ring);
+        S.ring = NULL;
+        return ESP_ERR_NO_MEM;
+    }
+    S.ctl = ctl;
+    return ESP_OK;
+}
+
+void rtl_source_set_freq(uint32_t lo_hz)
+{
+    S.want_lo_hz = lo_hz;
+    __atomic_store_n(&S.lo_pending, true, __ATOMIC_RELEASE);
+    if (S.ctl != NULL) {
+        xTaskNotifyGive(S.ctl);
+    }
+}
+
+void rtl_source_set_gain_db(int gain_db)
+{
+    if (gain_db < 0) gain_db = 0;
+    if (gain_db > 50) gain_db = 50;
+    S.want_gain_db = gain_db;
+    S.want_gain_auto = false;
+    __atomic_store_n(&S.gain_pending, true, __ATOMIC_RELEASE);
+    if (S.ctl != NULL) {
+        xTaskNotifyGive(S.ctl);
+    }
+}
+
+void rtl_source_set_gain_auto(bool enable)
+{
+    S.want_gain_auto = enable;
+    __atomic_store_n(&S.gain_pending, true, __ATOMIC_RELEASE);
+    if (S.ctl != NULL) {
+        xTaskNotifyGive(S.ctl);
+    }
+}
+
+esp_err_t rtl_source_read_float(float *i, float *q, size_t frames, uint32_t timeout_ms)
+{
+    if (S.ring == NULL || frames == 0 || frames > HIGH_WATER_FRAMES / 2) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    S.reader = xTaskGetCurrentTaskHandle();
+
+    const TickType_t t0 = xTaskGetTickCount();
+    const TickType_t tmo = pdMS_TO_TICKS(timeout_ms);
+    uint32_t avail;
+
+    for (;;) {
+        avail = __atomic_load_n(&S.head, __ATOMIC_ACQUIRE) - S.tail;
+        if (!S.primed && avail >= RTL_RATE_PRIME_FRAMES) {
+            rtl_rate_ctl_reset(&S.rc);
+            S.step_req = 1.0f;
+            S.primed = true;
+        }
+        if (S.primed && avail >= frames) {
+            break;
+        }
+        const TickType_t elapsed = xTaskGetTickCount() - t0;
+        if (elapsed >= tmo) {
+            S.primed = false;
+            S.step_req = 1.0f;
+            S.underruns++;
+            return ESP_ERR_TIMEOUT;
+        }
+        ulTaskNotifyTake(pdTRUE, tmo - elapsed);
+    }
+
+    /* Consistent (head, arrival time) snapshot */
+    uint32_t head, s1, s2;
+    int64_t t_arr;
+    do {
+        s1 = __atomic_load_n(&S.arr_seq, __ATOMIC_ACQUIRE);
+        head = __atomic_load_n(&S.head, __ATOMIC_RELAXED);
+        t_arr = S.arr_t_us;
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        s2 = __atomic_load_n(&S.arr_seq, __ATOMIC_RELAXED);
+    } while ((s1 & 1u) || s1 != s2);
+
+    uint32_t tail = S.tail;
+
+    /* Far above target: the consumer stalled for a while. Jump to the target level. */
+    if (head - tail > HIGH_WATER_FRAMES) {
+        const uint32_t skip = (head - tail) - RTL_RATE_TARGET_FRAMES;
+        tail += skip;
+        S.skipped += skip;
+        rtl_rate_ctl_reset(&S.rc);
+    }
+
+    const float level = rtl_level_estimate(head - tail, esp_timer_get_time() - t_arr);
+    S.step_req = rtl_rate_ctl_update(&S.rc, level, true);
+
+    const float k = 1.0f / (float)INT16_MAX;
+    for (size_t n = 0; n < frames; n++) {
+        const iq16_t v = S.ring[(tail + n) & RING_MASK];
+        i[n] = (float)v.i * k;
+        q[n] = (float)v.q * k;
+    }
+    __atomic_store_n(&S.tail, tail + (uint32_t)frames, __ATOMIC_RELEASE);
+    return ESP_OK;
+}
+
+bool rtl_source_is_streaming(void)
+{
+    return S.streaming;
+}
+
+void rtl_source_get_stats(rtl_source_stats_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    out->streaming = S.streaming;
+    out->fifo_frames = __atomic_load_n(&S.head, __ATOMIC_ACQUIRE) - __atomic_load_n(&S.tail, __ATOMIC_ACQUIRE);
+    out->step_ppm = (S.step_req - 1.0f) * 1e6f;
+    out->fifo_overruns = S.fifo_overruns;
+    out->underruns = S.underruns;
+    out->skipped_frames = S.skipped;
+    if (S.streaming) {
+        esp_rtl_sdr_metrics_t m;
+        if (esp_rtl_sdr_get_metrics(S.sdr, &m) == ESP_OK) {
+            out->usb_overruns = m.overruns;
+            out->usb_drops = m.consumer_drops;
+            out->effective_sps = m.effective_sps;
+        }
+    }
+}

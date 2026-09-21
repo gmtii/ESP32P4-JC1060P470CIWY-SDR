@@ -1,170 +1,216 @@
-# LVGL Demo v9
+# ESP32-P4 SDR receiver for the JC1060P470CIWY board
 
-[中文版本](./README_CN.md)
+A standalone software-defined radio receiver running on an ESP32-P4 board
+(JC1060P470CIWY, 1024×600 MIPI-DSI display). It receives with an
+**RTL-SDR Blog V4** connected to the P4's USB High-Speed host port, demodulates
+on the chip, shows a spectrum/waterfall on the LVGL touch-screen UI and plays
+the audio through an external **NAU8822** codec.
 
-This example demonstrates how to port LVGL v9 and conduct performance testing using LVGL's built-in demos. The example utilizes the development board's MIPI-DSI interface. Based on this example, applications based on LVGL v9 can be developed.
+> **Status: experimental.** The RTL-SDR input path has been validated with
+> host-side simulations (see [`test/`](test/)). On-air results: *(update me)*.
 
+## Features
 
-## Getting Started
+- Demodulation: USB, LSB, AM, synchronous AM (SAM, SAM-L, SAM-U) and FM
+- Selectable filter bandwidth per mode, noise reduction, software AGC
+- Spectrum and waterfall display, S-meter
+- Rotary encoder + button for tuning, LVGL menus for mode, filter and gain
+- UART command interface
+- 100 % on-chip DSP (ESP-DSP): no PC required
 
+## Hardware
 
-### Prerequisites
+| Part | Notes |
+|------|-------|
+| Board | ESP32-P4, JC1060P470CIWY, 1024×600 display (JD9165 controller) |
+| Receiver | RTL-SDR Blog V4 on the **USB High-Speed host** port |
+| Audio out | NAU8822 codec, I2S at 48 kHz (control over a 3-wire serial bus) |
+| Controls | Rotary encoder with push button |
 
-* An ESP32-P4-Function-EV-Board.
-* A 7-inch 1024 x 600 LCD screen powered by the [EK79007](https://dl.espressif.com/dl/schematics/display_driver_chip_EK79007AD_datasheet.pdf) IC, accompanied by a 32-pin FPC connection [adapter board](https://dl.espressif.com/dl/schematics/esp32-p4-function-ev-board-lcd-subboard-schematics.pdf) ([LCD Specifications](https://dl.espressif.com/dl/schematics/display_datasheet.pdf)).
-* A USB-C cable for power supply and programming.
-* Please refer to the following steps for the connection:
-    * **Step 1**. According to the table below, connect the pins on the back of the screen adapter board to the corresponding pins on the development board.
+The USB connector used for the dongle must be wired to the P4's **High-Speed**
+USB PHY and must provide 5 V on VBUS. The driver does not manage VBUS: board
+power switching, if any, is the application's job. Check your board schematic
+for the correct connector and any OTG host/device jumper. Do not use the
+UART/flash port.
 
-        | Screen Adapter Board | ESP32-P4-Function-EV-Board |
-        | -------------------- | -------------------------- |
-        | 5V (any one)         | 5V (any one)               |
-        | GND (any one)        | GND (any one)              |
-        | PWM                  | GPIO26                     |
-        | LCD_RST              | GPIO27                     |
-
-    * **Step 2**. Connect the FPC of LCD through the `MIPI_DSI` interface.
-    * **Step 3**. Use a USB-C cable to connect the `USB-UART` port to a PC (Used for power supply and viewing serial output).
-    * **Step 4**. Turn on the power switch of the board.
-
-
-### ESP-IDF Required
-
-- This example supports ESP-IDF release/v5.3 and later branches. By default, it runs on ESP-IDF release/v5.3.
-- Please follow the [ESP-IDF Programming Guide](https://docs.espressif.com/projects/esp-idf/en/latest/esp32/get-started/index.html) to set up the development environment. **We highly recommend** you [Build Your First Project](https://docs.espressif.com/projects/esp-idf/en/latest/esp32/get-started/index.html#build-your-first-project) to get familiar with ESP-IDF and make sure the environment is set up correctly.
-
-### Get the esp-dev-kits Repository
-
-To start from the examples in esp-dev-kits, clone the repository to the local PC by running the following commands in the terminal:
+## Signal path
 
 ```
-git clone --recursive https://github.com/espressif/esp-dev-kits.git
+RTL-SDR Blog V4 ──USB HS──► esp_rtl_sdr (USB Host client, callback mode)
+        CU8 I/Q @ 960 kSps
+              │  rtl_dsp.c
+              │   CIC 5:1  ─► variable-delay cubic resampler (192 kSps) ─► 96-tap FIR 4:1
+              ▼
+        int16 I/Q @ 48 kSps ──► FIFO (rtl_source.c) ──► sdr.c
+              │                      ▲
+              │        FIFO level steers the resampler to absorb
+              │        the dongle-vs-codec clock difference
+              ▼
+   ±fs/4 shift, ÷4 decimation (12 kHz), demodulation, filters, NR, AGC,
+   ×4 interpolation ─► I2S TX ─► NAU8822 ─► speaker/headphones
 ```
 
+Design notes:
 
-### Configuration
+- **LO offset.** The dongle's LO is tuned to `VFO − 12 kHz` (`FREQ_CONV_OFFSET`);
+  the wanted signal sits 12 kHz off centre and is brought to baseband by the
+  fs/4 shift in `sdr.c`. This also keeps the RTL's DC spike out of the passband.
+- **Clock drift.** The dongle and the codec run from different crystals. The
+  consumer measures the FIFO level once per audio block (extrapolating the time
+  since the last USB block arrived) and steers the resampler step with a
+  proportional controller. Samples are never dropped or repeated in normal
+  operation; a 100 ppm error costs a 0.01 % pitch offset.
+- **Spectrum orientation.** `sdr.c` expects the signal at −12 kHz for an LO at
+  `VFO − 12 kHz`, so `rtl_source.c` negates Q by default
+  (`RTL_SOURCE_CONJUGATE_IQ 1` in `main/include/rtl_source.h`). If USB and LSB
+  come out swapped, or a known carrier is not at the centre marker of the
+  spectrum, set it to 0.
+- **Tuning is non-blocking.** `rtl_source_set_freq()` and
+  `rtl_source_set_gain_db()` only post a request; a control task talks to the
+  dongle (latest request wins), so they are safe to call from LVGL callbacks.
 
-Run ``idf.py menuconfig`` and go to ``Board Support Package(ESP32-P4)``:
+## RTL-SDR driver (`esp_rtl_sdr`)
 
-```
-menuconfig > Component config > Board Support Package
-```
+USB access to the dongle is provided by
+[**esp-rtl-sdr**](https://github.com/hardcoreerik/esp-rtl-sdr) by hardcoreerik,
+a clean-room ESP-IDF USB Host client for RTL2832U-class dongles (not a librtlsdr
+port). It targets the ESP32-P4 High-Speed host, with the RTL-SDR Blog V4 as its
+primary supported device. This project was developed against v0.8.0-rc3.
 
+The driver is used in **callback delivery mode**: it hands each USB block to
+`rtl_source.c`, which converts it to 48 kSps I/Q and keeps its own FIFO.
 
-## How to Use the Example
+### Adding the driver to the project
 
+1. Put the driver in `components/esp_rtl_sdr` (the folder name is the component
+   name; the folder that contains the driver's `CMakeLists.txt` and `include/`
+   must sit directly under `components/`):
 
-### Build and Flash the Example
+   ```sh
+   git submodule add https://github.com/hardcoreerik/esp-rtl-sdr components/esp_rtl_sdr
+   ```
 
-Build the project and flash it to the board, then run monitor tool to view serial output (replace `PORT` with your board's serial port name):
+2. Add the component to `main/CMakeLists.txt` if the build cannot find
+   `esp_rtl_sdr.h`:
 
-```c
+   ```cmake
+   idf_component_register(... PRIV_REQUIRES esp_rtl_sdr)
+   ```
+
+3. With **ESP-IDF 6.x** the USB Host stack is no longer part of IDF; add it to
+   `main/idf_component.yml`:
+
+   ```yaml
+   dependencies:
+     espressif/usb: "*"
+   ```
+
+   The driver itself declares ESP-IDF ≥ 5.5 and its author tests on 5.5.x, so
+   6.x is not covered by the driver's own testing.
+
+4. In `sdkconfig.defaults`:
+
+   ```
+   CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE=1024
+   ```
+
+   Keep the P4 chip-revision settings your board needs.
+
+### Runtime API (`main/include/rtl_source.h`)
+
+| Function | Purpose |
+|----------|---------|
+| `rtl_source_init(lo_hz, gain_db)` | Start the control task; installs the driver and streams as soon as a dongle is present. Does not block on USB. |
+| `rtl_source_set_freq(lo_hz)` | Request a new LO frequency (VFO − `FREQ_CONV_OFFSET`). |
+| `rtl_source_set_gain_db(db)` / `rtl_source_set_gain_auto(bool)` | Manual tuner gain (0–50 dB) or the tuner's AGC. |
+| `rtl_source_read_float(i, q, n, timeout_ms)` | Blocking read of `n` I/Q frames at 48 kSps, called from the SDR task. Times out if no dongle is present. |
+| `rtl_source_is_streaming()` | Dongle attached and streaming. |
+| `rtl_source_get_stats(&s)` | FIFO level, drift correction (ppm), under/overruns, driver USB counters. |
+
+Hot-plug is handled by the control task: on disconnect or fault it stops and
+resets the driver, then restarts the stream with the last requested frequency
+and gain.
+
+### Notes and limits
+
+- **8-bit ADC.** The RTL-SDR has far less dynamic range than the previous
+  16-bit codec input. Set the gain (menu slider, 0–50 dB) so strong signals do
+  not overload the receiver, especially on crowded HF bands.
+- **HF and LF.** Below 28.8 MHz the V4 receives through its built-in
+  upconverter, handled by the driver. The driver documents LF (below 500 kHz)
+  as experimental. Minimum tuning frequency for the V4 is 24 kHz of LO.
+- **S-meter.** The level scale differs from the codec input; the S-meter offset
+  in `smeter.c` needs recalibration.
+- **Retunes are USB transactions.** Each VFO change reprograms the dongle's LO
+  over USB and takes a few milliseconds. Fine tuning by shifting in software
+  inside the 960 kHz capture window (retuning only when leaving it) is a
+  possible future improvement.
+- **Task priorities.** The driver's USB task runs at priority 20 and its
+  delivery task at 18. If `usb_overruns` grows in `rtl_source_get_stats()`, lower
+  the SDR task priority below 18.
+
+### Troubleshooting
+
+| Symptom | Likely cause |
+|---------|--------------|
+| `ERR_NO_DEVICE`, no `streaming` log line | Dongle in the wrong port (must be the HS host port), no VBUS, or dongle not a supported Blog V4 |
+| `install()` returns `ESP_RTL_SDR_ERR_USB_SAFE_MODE` | The driver's fault guard latched after repeated enumeration panics. Unplug the dongle, call `esp_rtl_sdr_usb_fault_guard_reset()`, reconnect, then install again |
+| USB and LSB swapped, or carrier off the centre marker | Flip `RTL_SOURCE_CONJUGATE_IQ` |
+| `usb_overruns` > 0, `effective_sps` < 960000 | USB port not at High-Speed, or SDR task starving the driver's delivery task |
+| Periodic `underruns` | SDR task not keeping up; check DSP load and LVGL task priority |
+
+## Building
+
+Requires ESP-IDF for the ESP32-P4 target.
+
+```sh
+idf.py set-target esp32p4
+idf.py build
 idf.py -p PORT flash monitor
 ```
 
-To exit the serial monitor, type ``Ctrl-]``.
+Managed dependencies include LVGL 9.2, ESP-DSP, `esp_lvgl_port`,
+`esp_codec_dev`, the display driver and the knob/button components (see
+`main/idf_component.yml`). Some of them need explicit version constraints
+depending on the ESP-IDF release; the working set is recorded in
+`dependencies.lock`.
 
-See the [ESP-IDF Getting Started Guide](https://docs.espressif.com/projects/esp-idf/en/latest/get-started/index.html) for full steps to configure and use ESP-IDF to build projects.
+## Tests
 
+The DSP chain and `rtl_source.c` have host-side tests that need only `gcc` (a
+fake driver and a pthread FreeRTOS shim stand in for the hardware):
 
-### Example Output
+```sh
+ESP_RTL_SDR_DIR=components/esp_rtl_sdr ./test/run_host_tests.sh
+```
 
-- The complete log is as follows:
+They cover amplitude response and alias rejection, I/Q orientation, closed-loop
+drift tracking (±100 ppm, no under/overruns, no phase discontinuities), retune,
+gain, unplug and replug.
 
-    ```c
-    I (25) boot: ESP-IDF v5.4-dev-2167-gdef35b1ca7-dirty 2nd stage bootloader
-    I (26) boot: compile time Sep 27 2024 17:00:31
-    I (27) boot: Multicore bootloader
-    I (32) boot: chip revision: v0.1
-    I (35) qio_mode: Enabling default flash chip QIO
-    I (40) boot.esp32p4: SPI Speed      : 80MHz
-    I (45) boot.esp32p4: SPI Mode       : QIO
-    I (49) boot.esp32p4: SPI Flash Size : 16MB
-    I (54) boot: Enabling RNG early entropy source...
-    I (60) boot: Partition Table:
-    I (63) boot: ## Label            Usage          Type ST Offset   Length
-    I (70) boot:  0 nvs              WiFi data        01 02 00009000 00006000
-    I (78) boot:  1 phy_init         RF data          01 01 0000f000 00001000
-    I (85) boot:  2 factory          factory app      00 00 00010000 00800000
-    I (93) boot:  3 storage          Unknown data     01 82 00810000 00700000
-    I (101) boot: End of partition table
-    I (105) esp_image: segment 0: paddr=00010020 vaddr=48060020 size=bacdch (765148) map
-    I (233) esp_image: segment 1: paddr=000cad04 vaddr=30100000 size=00020h (    32) load
-    I (235) esp_image: segment 2: paddr=000cad2c vaddr=30100020 size=0003ch (    60) load
-    I (240) esp_image: segment 3: paddr=000cad70 vaddr=4ff00000 size=052a8h ( 21160) load
-    I (253) esp_image: segment 4: paddr=000d0020 vaddr=48000020 size=5b534h (374068) map
-    I (315) esp_image: segment 5: paddr=0012b55c vaddr=4ff052a8 size=1caa0h (117408) load
-    I (338) esp_image: segment 6: paddr=00148004 vaddr=4ff21d80 size=03074h ( 12404) load
-    I (348) boot: Loaded app from partition at offset 0x10000
-    I (349) boot: Disabling RNG early entropy source...
-    I (360) hex_psram: vendor id    : 0x0d (AP)
-    I (361) hex_psram: Latency      : 0x01 (Fixed)
-    I (361) hex_psram: DriveStr.    : 0x00 (25 Ohm)
-    I (364) hex_psram: dev id       : 0x03 (generation 4)
-    I (370) hex_psram: density      : 0x07 (256 Mbit)
-    I (375) hex_psram: good-die     : 0x06 (Pass)
-    I (380) hex_psram: SRF          : 0x02 (Slow Refresh)
-    I (386) hex_psram: BurstType    : 0x00 ( Wrap)
-    I (391) hex_psram: BurstLen     : 0x03 (2048 Byte)
-    I (397) hex_psram: BitMode      : 0x01 (X16 Mode)
-    I (402) hex_psram: Readlatency  : 0x04 (14 cycles@Fixed)
-    I (408) hex_psram: DriveStrength: 0x00 (1/1)
-    I (413) MSPI DQS: tuning success, best phase id is 2
-    I (597) MSPI DQS: tuning success, best delayline id is 11
-    I esp_psram: Found 32MB PSRAM device
-    I esp_psram: Speed: 200MHz
-    I (597) mmu_psram: flash_drom_paddr_start: 0x10000
-    I (640) mmu_psram: flash_irom_paddr_start: 0xd0000
-    I (659) hex_psram: psram CS IO is dedicated
-    I (659) cpu_start: Multicore app
-    I (1091) esp_psram: SPI SRAM memory test OK
-    W (1101) clk: esp_perip_clk_init() has not been implemented yet
-    I (1108) cpu_start: Pro cpu start user code
-    I (1108) cpu_start: cpu freq: 360000000 Hz
-    I (1108) app_init: Application information:
-    I (1111) app_init: Project name:     lvgl_demo_v9
-    I (1117) app_init: App version:      7e53cd00-dirty
-    I (1122) app_init: Compile time:     Sep 27 2024 17:00:22
-    I (1128) app_init: ELF file SHA256:  506da7290...
-    I (1134) app_init: ESP-IDF:          v5.4-dev-2167-gdef35b1ca7-dirty
-    I (1141) efuse_init: Min chip rev:     v0.1
-    I (1146) efuse_init: Max chip rev:     v0.99 
-    I (1151) efuse_init: Chip rev:         v0.1
-    I (1155) heap_init: Initializing. RAM available for dynamic allocation:
-    I (1163) heap_init: At 4FF26B50 len 00014470 (81 KiB): RAM
-    I (1169) heap_init: At 4FF3AFC0 len 00004BF0 (18 KiB): RAM
-    I (1175) heap_init: At 4FF40000 len 00040000 (256 KiB): RAM
-    I (1182) heap_init: At 50108080 len 00007F80 (31 KiB): RTCRAM
-    I (1188) heap_init: At 3010005C len 00001FA4 (7 KiB): TCM
-    I (1194) esp_psram: Adding pool of 30848K of PSRAM memory to heap allocator
-    I (1202) spi_flash: detected chip: generic
-    I (1206) spi_flash: flash io: qio
-    W (1210) i2c: This driver is an old driver, please migrate your application code to adapt `driver/i2c_master.h`
-    I (1221) main_task: Started on CPU0
-    I (1244) esp_psram: Reserving pool of 32K of internal memory for DMA/internal allocations
-    I (1244) main_task: Calling app_main()
-    I (1246) LVGL: Starting LVGL task
-    W (1250) ledc: GPIO 26 is not usable, maybe conflict with others
-    I (1257) ESP32_P4_EV: MIPI DSI PHY Powered on
-    I (1263) ESP32_P4_EV: Install MIPI DSI LCD control panel
-    I (1268) ESP32_P4_EV: Install EK79007 LCD control panel
-    I (1274) ek79007: version: 0.1.0
-    I (1278) gpio: GPIO[27]| InputEn: 0| OutputEn: 1| OpenDrain: 0| Pullup: 0| Pulldown: 0| Intr:0 
-    I (1444) ESP32_P4_EV: Display initialized
-    E (1446) lcd_panel: esp_lcd_panel_swap_xy(50): swap_xy is not supported by this panel
-    W (1446) GT911: Unable to initialize the I2C address
-    I (1452) GT911: TouchPad_ID:0x39,0x31,0x31
-    I (1456) GT911: TouchPad_Config_Version:89
-    I (1461) ESP32_P4_EV: Setting LCD backlight: 100%
-    I (1542) main_task: Returned from app_main()
-    ...
-    ```
+## Repository layout
 
-## Technical Support and Feedback
+```
+main/
+  main.c, sdr.c            application entry, SDR task (demodulation chain)
+  rtl_source.c/.h          esp_rtl_sdr glue: control task, FIFO, drift loop
+  rtl_dsp.c/.h             CU8 → 48 kSps I/Q conversion (pure C, host-testable)
+  ui.c, menu.c, smeter.c   LVGL interface
+  nau8822.c, i2s_driver.c  audio output codec
+  uart_commands.c          UART command interface
+components/esp_rtl_sdr/    RTL-SDR USB driver (git submodule)
+test/                      host-side tests
+```
 
-Please use the following feedback channels:
+## Licence
 
-- For technical queries, go to the [esp32.com](https://esp32.com/viewforum.php?f=22) forum.
-- For a feature request or bug report, create a [GitHub issue](https://github.com/espressif/esp-dev-kits/issues).
+Project licence: *(add yours)*.
 
-We will get back to you as soon as possible.
+`esp_rtl_sdr` is licensed **AGPL-3.0-only**. Firmware that links it is a
+combined work: check the AGPL's terms before distributing binaries or hosting
+the firmware as a service.
+
+## Credits
+
+- [esp-rtl-sdr](https://github.com/hardcoreerik/esp-rtl-sdr) by hardcoreerik: the RTL2832U USB Host driver
+- [ESP-DSP](https://github.com/espressif/esp-dsp), [LVGL](https://lvgl.io/) and the Espressif component ecosystem

@@ -24,7 +24,7 @@
 #include "lvgl.h"
 
 #include "nau8822.h"
-#include "msi001.h"
+#include "rtl_source.h"
 
 #include "menu.h"
 
@@ -49,7 +49,7 @@ extern char *agc_texto[6];
  * VARIABLES DE LA APLICACIÓN
  * ========================================================= */
 static int32_t var_slider1 = 0x20;
-static int32_t var_slider2 = 43;
+static int32_t var_slider2 = 30; /* RTL tuner gain, dB */
 static int32_t var_slider3 = 31;
 static int32_t var_slider4 = 5;
 
@@ -183,7 +183,7 @@ static void slicer_dac_volume(lv_event_t *e)
     nau8822_spk_volume(var_slider1);
 }
 
-static void slider_msi_gain(lv_event_t *e)
+static void slider_rtl_gain(lv_event_t *e)
 {
     if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED)
         return;
@@ -192,7 +192,7 @@ static void slider_msi_gain(lv_event_t *e)
     var_slider2 = lv_slider_get_value(sl);
     lv_label_set_text_fmt(lbl_s2, "Slider 2: %ld", (long)var_slider2);
 
-    mirisdr_set_tuner_gain(var_slider2);
+    rtl_source_set_gain_db(var_slider2);
 }
 
 static void slider_adc_volume(lv_event_t *e)
@@ -473,8 +473,8 @@ void ui_create_control_panel(void)
 
     create_slider_block(row_sliders, "Volume", 0, 64,
                         var_slider1, slicer_dac_volume, &box_s1, &sl_s1, &lbl_s1);
-    create_slider_block(row_sliders, "MSI gain", 0, 90,
-                        var_slider2, slider_msi_gain, &box_s2, &sl_s2, &lbl_s2);
+    create_slider_block(row_sliders, "RTL gain", 0, 50,
+                        var_slider2, slider_rtl_gain, &box_s2, &sl_s2, &lbl_s2);
     create_slider_block(row_sliders, "DAC gain", 0, 63,
                         var_slider3, slider_adc_volume, &box_s3, &sl_s3, &lbl_s3);
     create_slider_block(row_sliders, "Brightness", 1, 200,
@@ -595,7 +595,7 @@ static void freq_btnm_event_cb(lv_event_t *e)
         {
             currentVFO.Frec = hz;
             refresca_VFO();
-            mirisdr_set_center_freq(currentVFO.Frec - 12000);
+            rtl_source_set_freq(currentVFO.Frec - FREQ_CONV_OFFSET);
         }
         return;
     }
@@ -606,7 +606,7 @@ static void freq_btnm_event_cb(lv_event_t *e)
         if (hz)
             currentVFO.Frec = hz;
         refresca_VFO();
-        mirisdr_set_center_freq(currentVFO.Frec - 12000);
+        rtl_source_set_freq(currentVFO.Frec - FREQ_CONV_OFFSET);
         freq_popup_close();
 
         inicia_timers();

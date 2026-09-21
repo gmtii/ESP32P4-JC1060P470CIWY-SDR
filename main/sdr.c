@@ -14,6 +14,7 @@
 
 #include "sdr.h"
 #include "sdr_priv.h"
+#include "rtl_source.h"
 
 #include "agc.h"
 #include "nr.h"
@@ -87,7 +88,6 @@ void IRAM_ATTR sdrTask(void *args)
 {
 
     esp_err_t ret = ESP_OK;
-    size_t bytes_read = 0;
     size_t bytes_write = 0;
 
     sam_variables_init();
@@ -136,20 +136,23 @@ void IRAM_ATTR sdrTask(void *args)
 
     while (1)
     {
-        /* Lee i2s ADC */
-        ret = i2s_channel_read(rx_handle, (char *)&sampleData_in[0].sample, SAMPLE_BUFFER_SIZE * 4, &bytes_read, 10);
+        /* Get one block of 48 kSps I/Q from the RTL-SDR chain (USB Host).
+         * The codec's I2S TX write below paces this loop; rtl_source absorbs
+         * the dongle-vs-codec clock difference. */
+        ret = rtl_source_read_float(i_sample, q_sample, SAMPLE_BUFFER_SIZE, 100);
+        if (ret != ESP_OK)
+        {
+            /* No dongle or stalled stream: keep the codec fed with silence */
+            memset(sampleData_out, 0, sizeof(sampleData_out));
+            i2s_channel_write(tx_handle, (char *)&sampleData_out[0].sample, SAMPLE_BUFFER_SIZE * 4, &bytes_write, 100);
+            continue;
+        }
 
         unsigned int start_sdrtask = dsp_get_cpu_cycle_count();
 
         /* Vectores para FFT */
-
-        for (i = 0; i < SAMPLE_BUFFER_SIZE; i++)
-        {
-            i_sample[i] = ((float)sampleData_in[i].ch[0] / (float)(INT16_MAX));
-            i_fft[i] = i_sample[i];
-            q_sample[i] = ((float)sampleData_in[i].ch[1] / (float)(INT16_MAX));
-            q_fft[i] = q_sample[i];
-        }
+        memcpy(i_fft, i_sample, sizeof(i_fft));
+        memcpy(q_fft, q_sample, sizeof(q_fft));
 
         if (demod_modo != DEMOD_FM)
         {
@@ -341,7 +344,7 @@ void IRAM_ATTR sdrTask(void *args)
         }
 
         // Envia el DAC SAMPLE_BUFFER_SIZE * 4 ( 2 canales, 16 bit cada uno)
-        ret = i2s_channel_write(tx_handle, (char *)&sampleData_out[0].sample, SAMPLE_BUFFER_SIZE * 4, &bytes_write, 10);
+        ret = i2s_channel_write(tx_handle, (char *)&sampleData_out[0].sample, SAMPLE_BUFFER_SIZE * 4, &bytes_write, 100);
     }
 
     // vTaskDelete(NULL);

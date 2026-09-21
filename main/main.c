@@ -25,7 +25,7 @@
 #include "ui.h"
 #include "sdr.h"
 #include "agc.h"
-#include "msi001.h"
+#include "rtl_source.h"
 #include "uart_commands.h"
 
 #include "pins_config.h"
@@ -237,7 +237,9 @@ void app_main(void)
 
     nau8822_spk_volume(0x20);
 
-    init_msi001();
+    /* RTL-SDR over USB Host replaces the MSI001 tuner + I2S RX input.
+     * LO sits FREQ_CONV_OFFSET below the VFO, as sdr.c expects. */
+    rtl_source_init(currentVFO.Frec - FREQ_CONV_OFFSET, 30);
 
     /* AGC */
     AGC_init();

@@ -14,7 +14,8 @@ idf_component_register(
     dsp_example.c
     nr_ss.c
     smeter.c
-    msi001.c
+    rtl_dsp.c
+    rtl_source.c
     uart_commands.c
     menu.c
     INCLUDE_DIRS .  ${INCLUDE_DIR}

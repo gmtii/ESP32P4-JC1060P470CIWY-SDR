@@ -18,7 +18,7 @@
 #include "smeter.h"
 #include "math.h"
 
-#include "msi001.h"
+#include "rtl_source.h"
 
 #include "images/smeter2.c"
 
@@ -575,7 +575,7 @@ void tarea_encoder(void *arg)
       currentVFO.Frec += diff * pasos_indice[pasos];
       refresca_VFO();
 
-      mirisdr_set_center_freq(currentVFO.Frec - 12000);
+      rtl_source_set_freq(currentVFO.Frec - FREQ_CONV_OFFSET);
     }
 
     vTaskDelay(pdMS_TO_TICKS(20)); // 50 Hz
