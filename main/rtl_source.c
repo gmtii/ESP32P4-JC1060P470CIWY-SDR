@@ -35,6 +35,16 @@ static const char *TAG = "rtl_source";
 #define CHUNK_BYTES       4096u                     /* DSP works in chunks of this size */
 #define OUT_CHUNK_FRAMES  128u                      /* >= RTL_DSP_MAX_FRAMES(CHUNK_BYTES) */
 
+/* Retry delays after a failed start. Running out of memory cannot fix itself, and every
+ * retry makes the driver replay its whole demodulator init table on an already
+ * configured dongle (EP0 STALLs), so wait much longer than for a missing device. */
+#ifndef RTL_SOURCE_RETRY_MS
+#define RTL_SOURCE_RETRY_MS       500u
+#endif
+#ifndef RTL_SOURCE_NOMEM_RETRY_MS
+#define RTL_SOURCE_NOMEM_RETRY_MS 10000u
+#endif
+
 typedef struct { int16_t i, q; } iq16_t;
 
 static struct {
@@ -63,6 +73,7 @@ static struct {
     volatile bool     gain_pending;
 
     uint32_t fifo_overruns, underruns, skipped;
+    uint32_t start_backoff_ms;                      /* ctl task only: wait before the next start attempt */
 } S;
 
 /* ------------------------------------------------------------------------- */
@@ -148,6 +159,7 @@ static void apply_gain(void)
 static bool start_stream(void)
 {
     size_t count = 0;
+    S.start_backoff_ms = RTL_SOURCE_RETRY_MS;
     (void)esp_rtl_sdr_refresh_device_list(S.sdr);
     (void)esp_rtl_sdr_get_device_count(S.sdr, &count);
     if (count == 0) {
@@ -168,9 +180,22 @@ static bool start_stream(void)
     st.frequency_hz = S.want_lo_hz;
     st.sample_rate_sps = RTL_DSP_IN_RATE;
 
+    /* start() needs ~96 KiB of DMA-capable internal RAM for the USB buffers (6 x 16 KiB,
+     * one contiguous block each), 6 x 16 KiB for its I/Q slots (PSRAM first) and a 6 KiB
+     * task stack. If it fails with ESP_ERR_NO_MEM, this line shows what was available. */
+    ESP_LOGI(TAG, "heap before start: internal free %u, largest internal DMA block %u, PSRAM free %u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+
     const esp_err_t err = esp_rtl_sdr_start(S.sdr, &st);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "start failed: %s", esp_rtl_sdr_err_to_name(err));
+        if (err == ESP_ERR_NO_MEM) {
+            ESP_LOGE(TAG, "out of memory starting the stream: free internal RAM (see the heap line above); "
+                          "next attempt in %u ms", (unsigned)RTL_SOURCE_NOMEM_RETRY_MS);
+            S.start_backoff_ms = RTL_SOURCE_NOMEM_RETRY_MS;
+        }
         return false;
     }
     S.fault = false;
@@ -213,10 +238,18 @@ static void ctl_task(void *arg)
         vTaskDelay(pdMS_TO_TICKS(2000));
     }
 
+    TickType_t next_start = xTaskGetTickCount();
+
     for (;;) {
         if (!S.streaming) {
+            /* Frequency/gain requests also wake this task; they must not cut the retry delay short */
+            const TickType_t now = xTaskGetTickCount();
+            if ((int32_t)(next_start - now) > 0) {
+                ulTaskNotifyTake(pdTRUE, next_start - now);
+                continue;
+            }
             if (!start_stream()) {
-                ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(500));
+                next_start = xTaskGetTickCount() + pdMS_TO_TICKS(S.start_backoff_ms);
             }
             continue;
         }
@@ -249,7 +282,12 @@ esp_err_t rtl_source_init(uint32_t initial_lo_hz, int initial_gain_db)
     if (S.ring != NULL) {
         return ESP_ERR_INVALID_STATE;
     }
-    S.ring = (iq16_t *)heap_caps_malloc(RING_FRAMES * sizeof(iq16_t), MALLOC_CAP_8BIT);
+    /* The FIFO is touched once per USB block and once per audio block: PSRAM is fast enough and
+     * keeps 32 KiB of scarce internal RAM free for the driver's DMA buffers. */
+    S.ring = (iq16_t *)heap_caps_malloc(RING_FRAMES * sizeof(iq16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (S.ring == NULL) {
+        S.ring = (iq16_t *)heap_caps_malloc(RING_FRAMES * sizeof(iq16_t), MALLOC_CAP_8BIT);
+    }
     if (S.ring == NULL) {
         return ESP_ERR_NO_MEM;
     }

@@ -1,7 +1,7 @@
 {
-  "idf.port": "/dev/ttyACM0",
-  "idf.flashType": "JTAG",
-  "idf.currentSetup": "/home/gmtii/.espressif/v6.0/esp-idf",
+  "idf.port": "/dev/ttyACM1",
+  "idf.flashType": "UART",
+  "idf.currentSetup": "/home/gmtii/esp/v5.5.1/esp-idf",
   "idf.customExtraVars": {
     "IDF_TARGET": "esp32p4",
     "OPENOCD_USB_ADAPTER_LOCATION": "1-4"

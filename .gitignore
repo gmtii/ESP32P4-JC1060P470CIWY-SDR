@@ -3,3 +3,5 @@
 components/lvgl/**
 build/**
 build/
+components/**
+components/

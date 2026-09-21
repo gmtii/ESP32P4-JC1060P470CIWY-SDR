@@ -205,6 +205,6 @@ direct_dependencies:
 - espressif/knob
 - idf
 - lvgl/lvgl
-manifest_hash: 8e92e5ee74e4ecc2d9391cc4dddc4be17895f89a209b2cad5bda1bf1cf1946f1
+manifest_hash: eebcda3e9d37083d7a191fbc92438c4beabfdbc1f49b6a902dd66a3918288723
 target: esp32p4
 version: 2.0.0
