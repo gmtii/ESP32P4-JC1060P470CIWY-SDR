@@ -19,6 +19,10 @@
 #include "math.h"
 
 #include "rtl_source.h"
+#include "esp_timer.h"
+
+/* Uncomment to log how long the FFT, spectrum and waterfall steps take (every 2 s) */
+// #define UI_PERF_LOG
 
 #include "images/smeter2.c"
 
@@ -119,14 +123,38 @@ void timer_dibuja_pantalla(lv_timer_t *timer)
 {
   if (screen_update)
   {
+#ifdef UI_PERF_LOG
+    static int64_t acc_fft, acc_spec, acc_wf;
+    static uint32_t n_frames;
+    const int64_t t0 = esp_timer_get_time();
+#endif
     calcula_fft();
+#ifdef UI_PERF_LOG
+    const int64_t t1 = esp_timer_get_time();
+#endif
     refresca_smeter = true;
 
     /* Task lock */
     if (lvgl_port_lock(0))
     {
       spectrum();
+#ifdef UI_PERF_LOG
+      const int64_t t2 = esp_timer_get_time();
+#endif
       waterfall_update();
+#ifdef UI_PERF_LOG
+      const int64_t t3 = esp_timer_get_time();
+      acc_fft += t1 - t0;
+      acc_spec += t2 - t1;
+      acc_wf += t3 - t2;
+      if (++n_frames >= 60)
+      {
+        ESP_LOGI("PERF", "per frame: fft %d us, spectrum %d us, waterfall %d us",
+                 (int)(acc_fft / n_frames), (int)(acc_spec / n_frames), (int)(acc_wf / n_frames));
+        acc_fft = acc_spec = acc_wf = 0;
+        n_frames = 0;
+      }
+#endif
       lvgl_port_unlock();
     }
   }
@@ -186,6 +214,16 @@ static inline void lv_draw_vline(int x, int y, int h, uint16_t color)
   }
 }
 
+/*
+ * 5-point smoothing with weights 0.50 / 0.18 / 0.07, in integer math (64/23/9 out of 128).
+ * The P4 FPU is single precision only: the previous expression used double constants,
+ * so every column ran ~18 soft-float double operations, twice per column, every frame.
+ */
+static inline int smooth5(const int16_t *p, int x)
+{
+  return (64 * p[x] + 23 * (p[x - 1] + p[x + 1]) + 9 * (p[x - 2] + p[x + 2])) >> 7;
+}
+
 void spectrum(void)
 {
 
@@ -204,8 +242,8 @@ void spectrum(void)
     // moving window - weighted average of 5 points of the spectrum to smooth spectrum in the frequency domain
     // weights:  x: 50% , x-1/x+1: 36%, x+2/x-2: 14%
 
-    y_new = pixelnew[x] * 0.5 + pixelnew[x - 1] * 0.18 + pixelnew[x + 1] * 0.18 + pixelnew[x - 2] * 0.07 + pixelnew[x + 2] * 0.07;
-    y_old = pixelold[x] * 0.5 + pixelold[x - 1] * 0.18 + pixelold[x + 1] * 0.18 + pixelold[x - 2] * 0.07 + pixelold[x + 2] * 0.07;
+    y_new = smooth5(pixelnew, x);
+    y_old = smooth5(pixelold, x);
 
     if (y_old > (spectrum_height - 1))
     {
@@ -763,6 +801,13 @@ void smeter_set_dbm(float dbm)
       ratio * (SMETER_ANGLE_MAX - SMETER_ANGLE_MIN);
 
   int angle_deg = (int)angle_f;
+
+  /* lv_line_set_points() always invalidates the needle area (335x145 px here), even if the
+   * points did not change. Skip it while the needle stays on the same degree. */
+  static int last_angle_deg = -100000;
+  if (angle_deg == last_angle_deg)
+    return;
+  last_angle_deg = angle_deg;
 
   int32_t s = lv_trigo_sin(angle_deg);
   int32_t c = lv_trigo_cos(angle_deg);

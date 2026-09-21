@@ -371,8 +371,13 @@ void IRAM_ATTR calcula_fft(void)
         pixelold[i] = pixelnew[i];
     }
 
-    // Generate hann window
-    dsps_wind_hann_f32(wind, N);
+    // Hann window: constant, so compute it only once (1024 cosf per frame otherwise)
+    static bool wind_ready = false;
+    if (!wind_ready)
+    {
+        dsps_wind_hann_f32(wind, N);
+        wind_ready = true;
+    }
 
     // Convert two input vectors to one complex vector i,q
     for (int i = 0; i < N; i++)
@@ -399,7 +404,8 @@ void IRAM_ATTR calcula_fft(void)
 
     for (int i = 0; i < N; i++)
     {
-        fft_mag[i] = 0.6 * fft_mag[i] + 0.4 * fft_mag_old[i];
+        /* 'f' suffix: the P4 FPU is single precision only, a double constant makes this soft-float */
+        fft_mag[i] = 0.6f * fft_mag[i] + 0.4f * fft_mag_old[i];
         fft_mag_old[i] = fft_mag[i];
         pixelnew[N - 1 - i] = 20 * log10f_fast(fft_mag[i] * (float)(32768.0f));
 
