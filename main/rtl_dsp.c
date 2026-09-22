@@ -58,6 +58,11 @@ void rtl_dsp_set_step(rtl_dsp_t *d, float step)
     d->step = step;
 }
 
+void rtl_dsp_set_wide(rtl_dsp_t *d, bool wide)
+{
+    d->wide = wide;
+}
+
 static inline int16_t to_i16(float v)
 {
     v *= 32767.0f;
@@ -124,6 +129,28 @@ size_t rtl_dsp_process(rtl_dsp_t *d, const uint8_t *cu8, size_t n_bytes,
             const float yi = lagrange3(d->hist_i, d->mu);
             const float yq = lagrange3(d->hist_q, d->mu);
             d->mu += step;
+
+            if (d->wide) {
+                /* Wide (WFM) tap: emit the resampler's own 192 kSps output directly, no
+                 * further decimation. Anti-aliasing here relies solely on the CIC's own
+                 * roll-off across the full +-96 kHz Nyquist (no 96-tap FIR cleanup as the
+                 * narrow path gets) - some droop toward the band edges is expected; this
+                 * is adequate for an FM discriminator, tuned so the wanted signal sits
+                 * near the centre, but would be worth revisiting for weak-signal or
+                 * high-fidelity (stereo/RDS) use. */
+                float acc_i = yi, acc_q = yq;
+                if (d->conjugate) {
+                    acc_q = -acc_q;
+                }
+                if (n_out < max_out_frames) {
+                    out[2 * n_out] = to_i16(acc_i);
+                    out[2 * n_out + 1] = to_i16(acc_q);
+                    n_out++;
+                } else {
+                    d->out_dropped++;
+                }
+                continue;
+            }
 
             /* --- FIR decimator (192 -> 48 kSps) --- */
             const uint32_t pos = d->dl_pos;

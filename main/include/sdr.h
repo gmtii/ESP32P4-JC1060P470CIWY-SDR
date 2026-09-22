@@ -17,6 +17,21 @@ extern "C"
 #define FREQ_CONV_OFFSET (SAMPLE_RATE / DR)
 
 #define WAVEFORM_WIDTH SAMPLE_BUFFER_SIZE
+
+/*
+ * One sdrTask() iteration's worth of wide-mode I/Q: chosen so it spans exactly
+ * the same wall-clock time as SAMPLE_BUFFER_SIZE frames at the normal 48 kSps
+ * (1024/48000 == 4096/192000 == 21.3 ms), so the loop's cadence - and the
+ * audio_out_write(SAMPLE_BUFFER_SIZE) call at the end of it - is unaffected by
+ * which mode is active. Must track RTL_DSP_WIDE_RATE/RTL_DSP_OUT_RATE (4) in
+ * rtl_dsp.h; a comment there points back here.
+ */
+#define WFM_BUFFER_SIZE (SAMPLE_BUFFER_SIZE * 4)
+
+/* Nominal broadcast FM peak deviation, used to scale the discriminator's Hz output
+ * to the same +-1.0-ish full-scale convention every other demod_out value uses. */
+#define WFM_MAX_DEVIATION_HZ 75000.0f
+
 #define WAVEFORM_HEIGHT 192
 #define WATERFALL_HEIGHT 128
 
@@ -27,6 +42,25 @@ extern "C"
 #define DEMOD_SAML 4
 #define DEMOD_SAMU 5
 #define DEMOD_FM 6
+/*
+ * Broadcast FM (WFM): unlike every other mode, this one reads I/Q at the wide
+ * 192 kSps tap (rtl_source_set_wide()) instead of the usual 48 kSps, because a
+ * 75 kHz-deviation signal needs a Carson bandwidth (~180 kHz) far beyond what
+ * 48 kSps I/Q (+-24 kHz) can carry - that's also why NFM (DEMOD_FM) is capped
+ * at a few kHz of deviation, not because of any deliberate design choice there.
+ */
+#define DEMOD_WFM 7
+
+/*
+ * LO offset for the current mode: every mode but WFM tunes FREQ_CONV_OFFSET (12 kHz)
+ * below the wanted frequency (see sdr.c's fs/4 shift). WFM's ~180 kHz Carson bandwidth
+ * leaves no room for that trick without pushing the station off-centre in the (already
+ * full) 192 kHz window, so it tunes directly on-frequency instead.
+ */
+static inline uint32_t lo_offset_for_mode(int demod_modo)
+{
+    return (demod_modo == DEMOD_WFM) ? 0u : (uint32_t)FREQ_CONV_OFFSET;
+}
 
 #define F_CW 0
 #define F_1K8 1

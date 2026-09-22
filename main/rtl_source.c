@@ -29,11 +29,18 @@
 
 static const char *TAG = "rtl_source";
 
-#define RING_FRAMES       8192u                     /* power of two, ~170 ms          */
+/*
+ * Sized for the worst case (wide/WFM mode, 192 kSps): RING_FRAMES gives the same
+ * ~170 ms of headroom wide mode had at 48 kSps (8192 frames there), scaled by the
+ * RTL_DSP_WIDE_RATE/RTL_DSP_OUT_RATE ratio (4x). Narrow mode gets proportionally
+ * more headroom in wide mode's frame units, which is harmless. OUT_CHUNK_FRAMES
+ * covers RTL_DSP_WIDE_MAX_FRAMES(CHUNK_BYTES) (~421 with today's sizes), well
+ * above narrow mode's ~108.
+ */
+#define RING_FRAMES       32768u                    /* power of two, ~170 ms at wide rate */
 #define RING_MASK         (RING_FRAMES - 1u)
-#define HIGH_WATER_FRAMES 6144u                     /* above this the consumer skips  */
 #define CHUNK_BYTES       4096u                     /* DSP works in chunks of this size */
-#define OUT_CHUNK_FRAMES  128u                      /* >= RTL_DSP_MAX_FRAMES(CHUNK_BYTES) */
+#define OUT_CHUNK_FRAMES  512u                      /* >= RTL_DSP_WIDE_MAX_FRAMES(CHUNK_BYTES) */
 
 /* Retry delays after a failed start. Running out of memory cannot fix itself, and every
  * retry makes the driver replay its whole demodulator init table on an already
@@ -71,6 +78,20 @@ static struct {
     uint32_t arr_t_us32;
     volatile bool primed;
 
+    /*
+     * Narrow (48 kSps, default) vs wide (192 kSps, WFM) tap. `wide`/`rate_mult`/
+     * `target_raw`/`high_water_raw` are owned by the delivery task (process_block()
+     * applies a pending switch there - see rtl_source_set_wide()); `want_wide` and
+     * `wide_pending` are the reader's request, mirroring how `step_req` and the
+     * lo/gain `*_pending` flags already cross the same two tasks.
+     */
+    bool wide;
+    uint32_t rate_mult;                             /* RTL_DSP_WIDE_RATE/RTL_DSP_OUT_RATE when wide, else 1 */
+    uint32_t target_raw;                            /* RTL_RATE_TARGET_FRAMES, in the active rate's raw frames */
+    uint32_t high_water_raw;                        /* likewise, the skip-ahead threshold */
+    volatile bool want_wide;
+    volatile bool wide_pending;
+
     volatile TaskHandle_t reader;
     volatile TaskHandle_t ctl;
 
@@ -95,6 +116,22 @@ static struct {
 static void process_block(const uint8_t *data, size_t bytes)
 {
     int16_t out[2 * OUT_CHUNK_FRAMES];
+
+    if (__atomic_exchange_n(&S.wide_pending, false, __ATOMIC_ACQUIRE)) {
+        const bool wide = S.want_wide;
+        rtl_dsp_set_wide(&S.dsp, wide);
+        S.wide = wide;
+        S.rate_mult = wide ? (RTL_DSP_WIDE_RATE / RTL_DSP_OUT_RATE) : 1u;
+        S.target_raw = RTL_RATE_TARGET_FRAMES * S.rate_mult;
+        S.high_water_raw = (RTL_RATE_TARGET_FRAMES * 12u / 5u) * S.rate_mult;
+        /* Flush: frames already queued are at the OLD rate's duration and would corrupt
+         * the drift-level math if left mixed with new-rate frames. Safe to do here even
+         * though `tail` belongs to the reader: this only ever moves `head` forward to
+         * meet it (never past it), so the reader never sees head-tail go negative. */
+        const uint32_t tail_now = __atomic_load_n(&S.tail, __ATOMIC_ACQUIRE);
+        __atomic_store_n(&S.head, tail_now, __ATOMIC_RELEASE);
+        S.primed = false;
+    }
 
     rtl_dsp_set_step(&S.dsp, S.step_req);
 
@@ -176,6 +213,12 @@ static bool start_stream(void)
     }
 
     rtl_dsp_init(&S.dsp, RTL_SOURCE_CONJUGATE_IQ != 0);
+    rtl_dsp_set_wide(&S.dsp, S.want_wide);
+    S.wide = S.want_wide;
+    S.rate_mult = S.wide ? (RTL_DSP_WIDE_RATE / RTL_DSP_OUT_RATE) : 1u;
+    S.target_raw = RTL_RATE_TARGET_FRAMES * S.rate_mult;
+    S.high_water_raw = (RTL_RATE_TARGET_FRAMES * 12u / 5u) * S.rate_mult;
+    __atomic_store_n(&S.wide_pending, false, __ATOMIC_RELAXED);
     S.step_req = 1.0f;
     S.primed = false;
 
@@ -304,6 +347,9 @@ esp_err_t rtl_source_init(uint32_t initial_lo_hz, int initial_gain_db)
     S.want_gain_db = initial_gain_db;
     S.want_gain_auto = false;
     S.step_req = 1.0f;
+    S.rate_mult = 1u;
+    S.target_raw = RTL_RATE_TARGET_FRAMES;
+    S.high_water_raw = RTL_RATE_TARGET_FRAMES * 12u / 5u;   /* == 6144, same as narrow mode always used before */
     rtl_rate_ctl_reset(&S.rc);
 
     TaskHandle_t ctl = NULL;
@@ -337,6 +383,18 @@ void rtl_source_set_gain_db(int gain_db)
     }
 }
 
+void rtl_source_set_wide(bool wide)
+{
+    if (S.want_wide == wide) {
+        return;   /* already there, or already requested: nothing to do */
+    }
+    S.want_wide = wide;
+    __atomic_store_n(&S.wide_pending, true, __ATOMIC_RELEASE);
+    /* No need to wake anyone: process_block() picks this up on its own very next
+     * call, which arrives every ~8.5 ms regardless (USB delivery keeps running
+     * unconditionally - a mode switch never stops or restarts the dongle). */
+}
+
 void rtl_source_set_gain_auto(bool enable)
 {
     S.want_gain_auto = enable;
@@ -348,7 +406,7 @@ void rtl_source_set_gain_auto(bool enable)
 
 esp_err_t rtl_source_read_float(float *i, float *q, size_t frames, uint32_t timeout_ms)
 {
-    if (S.ring == NULL || frames == 0 || frames > HIGH_WATER_FRAMES / 2) {
+    if (S.ring == NULL || frames == 0 || frames > S.high_water_raw / 2) {
         return ESP_ERR_INVALID_STATE;
     }
     S.reader = xTaskGetCurrentTaskHandle();
@@ -359,7 +417,10 @@ esp_err_t rtl_source_read_float(float *i, float *q, size_t frames, uint32_t time
 
     for (;;) {
         avail = __atomic_load_n(&S.head, __ATOMIC_ACQUIRE) - S.tail;
-        if (!S.primed && avail >= RTL_RATE_PRIME_FRAMES) {
+        const uint32_t rm = S.rate_mult ? S.rate_mult : 1u;
+        /* PRIME_FRAMES is a fixed 48 kSps-equivalent threshold (~75 ms): normalize the
+         * raw ring level by the active rate's multiplier before comparing against it. */
+        if (!S.primed && (avail / rm) >= RTL_RATE_PRIME_FRAMES) {
             rtl_rate_ctl_reset(&S.rc);
             S.step_req = 1.0f;
             S.primed = true;
@@ -385,16 +446,21 @@ esp_err_t rtl_source_read_float(float *i, float *q, size_t frames, uint32_t time
 
     uint32_t tail = S.tail;
 
-    /* Far above target: the consumer stalled for a while. Jump to the target level. */
-    if (head - tail > HIGH_WATER_FRAMES) {
-        const uint32_t skip = (head - tail) - RTL_RATE_TARGET_FRAMES;
+    /* Far above target: the consumer stalled for a while. Jump to the target level.
+     * Both thresholds are pre-scaled to the active rate's raw frames (see process_block()). */
+    if (head - tail > S.high_water_raw) {
+        const uint32_t skip = (head - tail) - S.target_raw;
         tail += skip;
         S.skipped += skip;
         rtl_rate_ctl_reset(&S.rc);
     }
 
+    const uint32_t rm2 = S.rate_mult ? S.rate_mult : 1u;
     const uint32_t now32 = (uint32_t)esp_timer_get_time();
-    const float level = rtl_level_estimate(head - tail, (int64_t)(now32 - t_arr32)); /* wraps correctly: both are the low 32 bits of the same clock, and the gap is always well under 2^31 us */
+    /* Normalize back to 48 kSps-equivalent frames: rtl_level_estimate()'s own "since
+     * last arrival" extrapolation is hardcoded in those units (RTL_DSP_OUT_RATE), and
+     * the drift controller's constants (RTL_RATE_TARGET_FRAMES etc.) are too. */
+    const float level = rtl_level_estimate((head - tail) / rm2, (int64_t)(now32 - t_arr32)); /* wraps correctly: both are the low 32 bits of the same clock, and the gap is always well under 2^31 us */
     S.step_req = rtl_rate_ctl_update(&S.rc, level, true);
 
     const float k = 1.0f / (float)INT16_MAX;
@@ -418,6 +484,7 @@ void rtl_source_get_stats(rtl_source_stats_t *out)
     out->streaming = S.streaming;
     out->fifo_frames = __atomic_load_n(&S.head, __ATOMIC_ACQUIRE) - __atomic_load_n(&S.tail, __ATOMIC_ACQUIRE);
     out->step_ppm = (S.step_req - 1.0f) * 1e6f;
+    out->wide = S.wide;
     out->fifo_overruns = S.fifo_overruns;
     out->underruns = S.underruns;
     out->skipped_frames = S.skipped;

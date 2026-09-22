@@ -32,14 +32,19 @@
 static char *TAG = "MAIN";
 esp_ldo_channel_handle_t ldo3 = NULL;
 
-const char *demod_modos_texto[7] = {
+/* Sized for DEMOD_WFM (7) too, even though label_modos/btn_modos's cycle (indices 0-5)
+ * and the dedicated FM/WFM button (label4, indicator lamps) never actually read index 6
+ * or 7 in practice - this just removes the one-past-the-end read that would otherwise
+ * be latent (and now reachable, with DEMOD_WFM added) if that ever changed. */
+const char *demod_modos_texto[8] = {
     "USB ", // 0
     "LSB ",
     "AM  ",
     "SAM ",
     "S-L ",
     "S-U ",
-    "FM  " // 6
+    "FM  ", // 6
+    "WFM " // 7
 };
 
 const char *pasos_texto[7] = {

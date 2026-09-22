@@ -87,6 +87,26 @@ extern "C"
 
     /* --------------------------------------------------------------------------------- */
 
+    /* WFM (broadcast FM, DEMOD_WFM): separate from fm_variables_t/fm_variables above
+     * (NFM's own state) so switching between NFM and WFM never cross-contaminates the
+     * other mode's discriminator phase memory. See sdr.c's DEMOD_WFM branch. */
+    typedef struct
+    {
+        float i_sample_prev, q_sample_prev; /* discriminator phase memory, at RTL_DSP_WIDE_RATE */
+        float deemph_state;                 /* 50 us de-emphasis IIR state, same rate */
+    } wfm_variables_t;
+
+    wfm_variables_t wfm_variables;
+
+    float i_sample_wide[WFM_BUFFER_SIZE];
+    float q_sample_wide[WFM_BUFFER_SIZE];
+    float wfm_discrim[WFM_BUFFER_SIZE];     /* discriminator + de-emphasis output, pre-decimation */
+
+    fir_f32_t fird_wfm;
+    float fird_wfm_delay[FIR_COEFFS_LEN];
+
+    /* --------------------------------------------------------------------------------- */
+
     union
     {
         uint32_t sample;

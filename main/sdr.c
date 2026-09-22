@@ -15,6 +15,7 @@
 #include "sdr.h"
 #include "sdr_priv.h"
 #include "rtl_source.h"
+#include "rtl_dsp.h"
 #include "audio_out.h"
 
 #include "agc.h"
@@ -132,14 +133,40 @@ void IRAM_ATTR sdrTask(void *args)
 
     generate_FIR_coefficients(fird_coeffs, FIR_COEFFS_LEN, 0.75 / DR);
 
+    /* WFM (broadcast FM) decimator: 192 -> 48 kSps, cutoff at the mono audio bandwidth
+     * (~15 kHz). NOT the same 0.75/DR convention fird_i/fird_q use above - that value is
+     * normalized to THEIR 48 kHz input, and reused verbatim here (192 kHz input) would
+     * put the cutoff at 36 kHz, decimating with almost no anti-alias protection at all. */
+    float fird_wfm_coeffs[FIR_COEFFS_LEN];
+    dsps_fird_init_f32(&fird_wfm, fird_wfm_coeffs, fird_wfm_delay, FIR_COEFFS_LEN, DR);
+    generate_FIR_coefficients(fird_wfm_coeffs, FIR_COEFFS_LEN, 15000.0f / (float)RTL_DSP_WIDE_RATE);
+
+    /* 50 us de-emphasis (EU broadcast standard), one-pole IIR at RTL_DSP_WIDE_RATE */
+    const float wfm_dt = 1.0f / (float)RTL_DSP_WIDE_RATE;
+    const float wfm_tau = 50e-6f;
+    const float wfm_deemph_alpha = wfm_dt / (wfm_tau + wfm_dt);
+
     int i = 0;
 
     while (1)
     {
-        /* Get one block of 48 kSps I/Q from the RTL-SDR chain (USB Host).
-         * The codec's I2S TX write below paces this loop; rtl_source absorbs
-         * the dongle-vs-codec clock difference. */
-        ret = rtl_source_read_float(i_sample, q_sample, SAMPLE_BUFFER_SIZE, 100);
+        /* WFM needs the wide 192 kSps I/Q tap (see sdr.h's WFM_BUFFER_SIZE comment);
+         * every other mode keeps the normal 48 kSps one. Safe to call every iteration:
+         * rtl_source_set_wide() only acts (and briefly re-primes) when the mode actually
+         * changes, so this costs nothing the rest of the time. */
+        const bool wfm = (demod_modo == DEMOD_WFM);
+        rtl_source_set_wide(wfm);
+
+        /* The codec's I2S TX write below paces this loop; rtl_source absorbs the
+         * dongle-vs-codec clock difference either way. */
+        if (wfm)
+        {
+            ret = rtl_source_read_float(i_sample_wide, q_sample_wide, WFM_BUFFER_SIZE, 100);
+        }
+        else
+        {
+            ret = rtl_source_read_float(i_sample, q_sample, SAMPLE_BUFFER_SIZE, 100);
+        }
         if (ret != ESP_OK)
         {
             /* No dongle or stalled stream: keep the codec fed with silence */
@@ -150,11 +177,69 @@ void IRAM_ATTR sdrTask(void *args)
 
         unsigned int start_sdrtask = dsp_get_cpu_cycle_count();
 
-        /* Vectores para FFT */
-        memcpy(i_fft, i_sample, sizeof(i_fft));
-        memcpy(q_fft, q_sample, sizeof(q_fft));
+        /* Vectores para FFT: in WFM, fed from the wide buffer so the spectrum/waterfall
+         * show the whole ~192 kHz channel (a 1024-point FFT of 192 kHz-rate samples
+         * spans it exactly); every other mode keeps showing the normal 48 kHz span. */
+        if (wfm)
+        {
+            memcpy(i_fft, i_sample_wide, sizeof(i_fft));
+            memcpy(q_fft, q_sample_wide, sizeof(q_fft));
+        }
+        else
+        {
+            memcpy(i_fft, i_sample, sizeof(i_fft));
+            memcpy(q_fft, q_sample, sizeof(q_fft));
+        }
 
-        if (demod_modo != DEMOD_FM)
+        if (wfm)
+        {
+            /* Broadcast FM: discriminate at the full RTL_DSP_WIDE_RATE I/Q rate (needed
+             * for the ~180 kHz Carson bandwidth of a 75 kHz-deviation signal), then a
+             * 50 us de-emphasis and a real decimating FIR (fird_wfm, ~15 kHz cutoff -
+             * correctly normalized to this wide input rate, unlike the 0.75/DR narrow-
+             * band convention below) bring it down to the 48 kSps SAMPLE_BUFFER_SIZE
+             * block every other mode already produces each loop iteration.
+             *
+             * The discriminator's own formula, scaling and phase-memory handling exactly
+             * mirror the NFM branch below - only the sample rate and the deviation-to-
+             * amplitude normalization (WFM's much larger deviation) differ. NFM's own
+             * state (fm_variables) is untouched, so switching between NFM and WFM never
+             * cross-contaminates the other mode's discriminator phase memory. */
+            float angle, x, y;
+
+            for (i = 0; i < WFM_BUFFER_SIZE; i++)
+            {
+                y = (q_sample_wide[i] * wfm_variables.i_sample_prev) - (i_sample_wide[i] * wfm_variables.q_sample_prev);
+                x = (i_sample_wide[i] * wfm_variables.i_sample_prev) + (q_sample_wide[i] * wfm_variables.q_sample_prev);
+
+                angle = ApproxAtan2(y, x);
+
+                if (isnanf(angle))
+                {
+                    angle = 0.0f;
+                }
+
+                /* rad/sample -> Hz (f_dev = angle * fs / (2*pi)), normalized so that
+                 * +-WFM_MAX_DEVIATION_HZ maps to roughly +-1.0, the same full-scale
+                 * convention every other demod_out value already uses. */
+                float dev_hz = angle * (SDR_INV_PI_F * 0.5f * (float)RTL_DSP_WIDE_RATE);
+
+                wfm_variables.deemph_state += (dev_hz * (1.0f / WFM_MAX_DEVIATION_HZ) - wfm_variables.deemph_state) * wfm_deemph_alpha;
+                wfm_discrim[i] = wfm_variables.deemph_state;
+
+                wfm_variables.q_sample_prev = q_sample_wide[i];
+                wfm_variables.i_sample_prev = i_sample_wide[i];
+            }
+
+            dsps_fird_f32_ansi(&fird_wfm, wfm_discrim, demod_out, SAMPLE_BUFFER_SIZE);
+
+            for (i = 0; i < SAMPLE_BUFFER_SIZE; i++) // convierte a int16
+            {
+                sampleData_out[i].ch[0] = (int16_t)(demod_out[i] * (float)INT16_MAX);
+                sampleData_out[i].ch[1] = sampleData_out[i].ch[0];
+            }
+        }
+        else if (demod_modo != DEMOD_FM)
         {
             // Ya estamos en CODEC_SAMPLERATE
             // Hago una conversion de frecuencia a SR/4
@@ -240,7 +325,7 @@ void IRAM_ATTR sdrTask(void *args)
 
         /* Pongo entrada en salida */
 
-        if (1)
+        if (!wfm)
         {
 
             if (demod_modo != DEMOD_FM)

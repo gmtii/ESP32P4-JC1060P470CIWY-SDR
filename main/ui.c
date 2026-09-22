@@ -54,7 +54,7 @@ extern int filtro_indice;
 extern char *filtros_texto[5];
 extern char *agc_texto[6];
 
-extern char *demod_modos_texto[7];
+extern char *demod_modos_texto[8];
 extern char *pasos_texto[6];
 
 static bool bloqueo_pulsacion = false;
@@ -402,7 +402,24 @@ void btn_event_cb(lv_event_t *e)
     }
     else if (obj == btn4)
     {
-      demod_modo = DEMOD_FM;
+      /* Toggle between NFM and WFM (broadcast FM); any other mode's press just enters
+       * NFM, matching this button's previous, simpler behaviour. */
+      demod_modo = (demod_modo == DEMOD_FM) ? DEMOD_WFM : DEMOD_FM;
+      currentVFO.demod_modo = demod_modo;
+      lv_label_set_text_fmt(label4, "%s", (demod_modo == DEMOD_WFM) ? "WFM" : "NFM");
+
+      /* WFM tunes on-frequency (no 12 kHz offset - see lo_offset_for_mode()) and its
+       * signals are always strong broadcast carriers, so default to the tuner's AGC;
+       * leaving WFM restores whatever manual gain the slider was last set to. */
+      rtl_source_set_freq(currentVFO.Frec - lo_offset_for_mode(demod_modo));
+      rtl_source_set_gain_auto(demod_modo == DEMOD_WFM);
+      if (demod_modo != DEMOD_WFM)
+      {
+        rtl_source_set_gain_db(menu_get_rtl_gain_db());
+      }
+
+      dibuja_pasabanda();
+      refresca_indicadores();
     }
     else if (obj == btn5)
     {
@@ -614,7 +631,7 @@ void tarea_encoder(void *arg)
       currentVFO.Frec += diff * pasos_indice[pasos];
       refresca_VFO();
 
-      rtl_source_set_freq(currentVFO.Frec - FREQ_CONV_OFFSET);
+      rtl_source_set_freq(currentVFO.Frec - lo_offset_for_mode(demod_modo));
     }
 
     vTaskDelay(pdMS_TO_TICKS(20)); // 50 Hz
@@ -894,7 +911,7 @@ void dibuja_pasabanda(void)
       lv_obj_set_size(box_pasabanda, margen_alto, H);
       lv_obj_set_pos(box_pasabanda, W - W / 4 - margen_alto, 600 - WATERFALL_HEIGHT - WAVEFORM_HEIGHT);
     }
-    else if (demod_modo == DEMOD_FM)
+    else if (demod_modo == DEMOD_FM || demod_modo == DEMOD_WFM)
     {
       lv_obj_set_size(box_pasabanda, 0, 0);
       lv_obj_set_pos(box_pasabanda, W, 600 - WATERFALL_HEIGHT - WAVEFORM_HEIGHT);
@@ -1016,7 +1033,7 @@ void refresca_indicadores(void)
 
   indicador_update(7, "DNR", (f_nrss) ? 1 : 0);
   indicador_update(8, "NFM", (demod_modo == DEMOD_FM) ? 1 : 0);
-  indicador_update(9, "WFM", (demod_modo == DEMOD_FM) ? 1 : 0);
+  indicador_update(9, "WFM", (demod_modo == DEMOD_WFM) ? 1 : 0);
 
   indicador_update(10, filtros_texto[filtro_indice], true);
   indicador_update(11, agc_texto[agc_wdsp_conf.AGC_mode], true);

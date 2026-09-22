@@ -49,6 +49,8 @@ extern char *agc_texto[6];
  * ========================================================= */
 static int32_t var_slider1 = 50; /* output volume, percent */
 static int32_t var_slider2 = 30; /* RTL tuner gain, dB */
+
+int menu_get_rtl_gain_db(void) { return (int)var_slider2; }
 static int32_t var_slider4 = 5;
 
 static bool var_btn1 = false;
@@ -494,7 +496,7 @@ static void freq_btnm_event_cb(lv_event_t *e)
         {
             currentVFO.Frec = hz;
             refresca_VFO();
-            rtl_source_set_freq(currentVFO.Frec - FREQ_CONV_OFFSET);
+            rtl_source_set_freq(currentVFO.Frec - lo_offset_for_mode(demod_modo));
         }
         return;
     }
@@ -505,7 +507,7 @@ static void freq_btnm_event_cb(lv_event_t *e)
         if (hz)
             currentVFO.Frec = hz;
         refresca_VFO();
-        rtl_source_set_freq(currentVFO.Frec - FREQ_CONV_OFFSET);
+        rtl_source_set_freq(currentVFO.Frec - lo_offset_for_mode(demod_modo));
         freq_popup_close();
 
         inicia_timers();

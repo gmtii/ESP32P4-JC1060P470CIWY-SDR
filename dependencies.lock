@@ -67,12 +67,6 @@ dependencies:
       registry_url: https://components.espressif.com/
       type: service
     version: 1.8.2
-  espressif/esp32_p4_function_ev_board:
-    dependencies: []
-    source:
-      path: /home/gmtii/git/ESP32P4-JC1060P470CIWY-SDR-iberico/components/espressif__esp32_p4_function_ev_board
-      type: local
-    version: 4.1.1
   espressif/esp_codec_dev:
     component_hash: 014948481bda426cd46714f297fe1891711246c62bea288863a8cc8cf13ef1f0
     dependencies:
@@ -182,7 +176,7 @@ dependencies:
   idf:
     source:
       type: idf
-    version: 5.5.1
+    version: 5.5.5
   lvgl/lvgl:
     component_hash: 096c69af22eaf8a2b721e3913da91918c5e6bf1a762a113ec01f401aa61337a0
     dependencies: []
