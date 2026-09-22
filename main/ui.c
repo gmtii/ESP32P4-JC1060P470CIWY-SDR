@@ -620,15 +620,6 @@ void tarea_encoder(void *arg)
   }
 }
 
-void waterfall_scroll_down(uint16_t *buf)
-{
-  size_t row_bytes = WAVEFORM_WIDTH * sizeof(uint16_t);
-
-  memmove(&buf[WAVEFORM_WIDTH], // destino (fila 1)
-          &buf[0],              // origen (fila 0)
-          (WATERFALL_HEIGHT - 1) * row_bytes);
-}
-
 uint16_t fft_color_map(uint8_t v)
 {
   uint8_t r, g, b;
@@ -665,17 +656,27 @@ uint16_t fft_color_map(uint8_t v)
 
 void waterfall_update(void)
 {
-  // 1) Hacer scroll vertical
-  waterfall_scroll_down(waterfallbuffer);
+  /*
+   * Step the ring back one slot. That slot currently holds the row that is about to
+   * fall off the bottom (the oldest one, WATERFALL_HEIGHT steps behind); overwriting
+   * it makes it the new top row, and every other row's memory is untouched - no
+   * memmove, replacing what used to be a ~260 KB PSRAM copy every frame with two
+   * WAVEFORM_WIDTH-pixel writes.
+   */
+  waterfall_head = (waterfall_head == 0) ? (WATERFALL_HEIGHT - 1) : (waterfall_head - 1);
 
-  // 2) Generar la línea FFT y dibujarla en y = 0
+  uint16_t *row_a = &waterfallbuffer[waterfall_head * WAVEFORM_WIDTH];
+  uint16_t *row_b = &waterfallbuffer[(waterfall_head + WATERFALL_HEIGHT) * WAVEFORM_WIDTH];
   for (int x = 0; x < WAVEFORM_WIDTH; x++)
   {
-    uint8_t intensity = abs(pixelnew[x]); // 0–255
-    waterfallbuffer[x] = fft_color_map(intensity);
+    uint16_t c = fft_color_map((uint8_t)abs(pixelnew[x])); // 0-255 -> RGB565
+    row_a[x] = c;
+    row_b[x] = c;
   }
 
-  // 3) Invalidate para que LVGL refresque el canvas
+  /* Re-point the canvas at the new front of the ring. lv_canvas_set_buffer() only
+   * updates the canvas's internal buffer descriptor (no pixel copy), so this is cheap. */
+  lv_canvas_set_buffer(waterfall_canvas, row_a, WAVEFORM_WIDTH, WATERFALL_HEIGHT, LV_COLOR_FORMAT_RGB565);
   lv_obj_invalidate(waterfall_canvas);
 }
 
@@ -704,9 +705,14 @@ void init_ui()
   lv_canvas_set_buffer(waveform_canvas, waveformbuffer, CANVAS_W, CANVAS_H, LV_COLOR_FORMAT_RGB565);
 
   waterfall_canvas = lv_canvas_create(screen);
+  /* Double-height ring buffer (see the field comment in ui_priv.h): was
+   * WAVEFORM_WIDTH * WAVEFORM_HEIGHT (192 rows' worth, more than needed by mistake -
+   * WATERFALL_HEIGHT is 128 - but harmless since it only over-allocated). Now sized
+   * and named for what it actually holds: 2 * WATERFALL_HEIGHT rows. */
   waterfallbuffer = heap_caps_malloc(
-      WAVEFORM_WIDTH * WAVEFORM_HEIGHT * sizeof(uint16_t), MALLOC_CAP_SPIRAM);
-  memset(waterfallbuffer, 0x00, WAVEFORM_WIDTH * WATERFALL_HEIGHT * sizeof(uint16_t)); // índice 0 (negro)
+      2u * WAVEFORM_WIDTH * WATERFALL_HEIGHT * sizeof(uint16_t), MALLOC_CAP_SPIRAM);
+  memset(waterfallbuffer, 0x00, 2u * WAVEFORM_WIDTH * WATERFALL_HEIGHT * sizeof(uint16_t)); // índice 0 (negro)
+  waterfall_head = 0;
   lv_canvas_set_buffer(waterfall_canvas, waterfallbuffer, WAVEFORM_WIDTH, WATERFALL_HEIGHT, LV_COLOR_FORMAT_RGB565);
 
   // POSICION DE LOS CANVAS DE WATERFALL Y ESPECTRO!!!

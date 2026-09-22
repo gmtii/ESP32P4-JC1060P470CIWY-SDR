@@ -17,7 +17,6 @@ extern "C"
     lv_indev_t *lvgl_encoder_init(void);
     void tarea_encoder(void *arg);
     void waterfall_update(void);
-    void waterfall_scroll_down(uint16_t *buf);
     void dibuja_pasabanda(void);
     void inicia_smeter_ui(void);
     void smeter_set_dbm(float dbm);

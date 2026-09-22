@@ -120,7 +120,14 @@ extern "C"
     // static uint8_t waveformbuffer[BUF_SIZE] __attribute__((aligned(32)));
 
     uint16_t *waveformbuffer;
+    /*
+     * Waterfall ring buffer: 2*WATERFALL_HEIGHT rows, each row duplicated WATERFALL_HEIGHT
+     * rows apart (buf[r] == buf[r + WATERFALL_HEIGHT] at all times). Any WATERFALL_HEIGHT-row
+     * window starting at a row in [0, WATERFALL_HEIGHT) is then contiguous memory, so scrolling
+     * needs no memmove: waterfall_head just steps back by one slot per frame (see waterfall_update()).
+     */
     uint16_t *waterfallbuffer;
+    int waterfall_head;
 
 #define SMETER_PIVOT_X 168
 #define SMETER_PIVOT_Y 200
