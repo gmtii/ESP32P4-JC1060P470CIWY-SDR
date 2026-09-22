@@ -106,7 +106,8 @@ void refresca_VFO(void)
   // Proteger LVGL si usas esp_lvgl_port
   if (lvgl_port_lock(0))
   {
-    lv_label_set_text_fmt(freq_label, "%d%d.%d%d%d.%d%d%d",
+    lv_label_set_text_fmt(freq_label, "%d%d%d.%d%d%d.%d%d%d",
+                          (currentVFO.Frec % 1000000000) / 100000000,
                           (currentVFO.Frec % 100000000) / 10000000,
                           (currentVFO.Frec % 10000000) / 1000000,
                           (currentVFO.Frec % 1000000) / 100000,
