@@ -10,8 +10,13 @@ extern "C" {
 #include "math.h"
 
 
-#define TPI 2*M_PI
-#define PIH M_PI/2
+/* Single-precision, parenthesised. The P4 FPU has no double support, and the old
+ * definitions ("2*M_PI", "M_PI/2") were double constants without parentheses, so any
+ * float expression using them ran in soft-float. */
+#define SDR_PI_F 3.14159265358979323846f
+#define SDR_INV_PI_F 0.31830988618379067154f
+#define TPI (2.0f * SDR_PI_F)
+#define PIH (SDR_PI_F / 2.0f)
 #define FOURPI (2.0f * TPI)
 #define SIXPI (3.0f * TPI)
 

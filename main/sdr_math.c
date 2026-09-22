@@ -23,12 +23,12 @@ float ApproxAtan2(float y, float x)
             else if (y >= 0.0f)
             {
                 // atan2(y,x) = atan(y/x) + PI if x < 0, y >= 0
-                return ApproxAtan(z) + M_PI;
+                return ApproxAtan(z) + SDR_PI_F;
             }
             else
             {
                 // atan2(y,x) = atan(y/x) - PI if x < 0, y < 0
-                return ApproxAtan(z) - M_PI;
+                return ApproxAtan(z) - SDR_PI_F;
             }
         }
         else // Use property atan(y/x) = PI/2 - atan(x/y) if |y/x| > 1.

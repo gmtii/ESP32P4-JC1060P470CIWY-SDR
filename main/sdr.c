@@ -231,7 +231,7 @@ void IRAM_ATTR sdrTask(void *args)
                     angle = 0.0f;
                 }
 
-                demod_out[i] = (float)(angle / M_PI) * 0.1f;
+                demod_out[i] = angle * (SDR_INV_PI_F * 0.1f); /* was (angle / M_PI) * 0.1f: a soft-float double division per sample */
 
                 fm_variables.q_sample_prev = q_sample[i]; // save "previous" value of each channel to allow detection of the change of angle in next go-around
                 fm_variables.i_sample_prev = i_sample[i];

@@ -147,10 +147,10 @@ float calculadBm(void)
     // Tau = 10ms = 0.01s attack time
     // m_DecayAlpha = 0.0392; // 500ms decay time
     //
-    ui_calculatedbm_variables.m_AttackAvedbm = (1.0 - ui_calculatedbm_variables.m_AttackAlpha) * ui_calculatedbm_variables.m_AttackAvedbm + ui_calculatedbm_variables.m_AttackAlpha * ui_calculatedbm_variables.dbm;
-    ui_calculatedbm_variables.m_DecayAvedbm = (1.0 - ui_calculatedbm_variables.m_DecayAlpha) * ui_calculatedbm_variables.m_DecayAvedbm + ui_calculatedbm_variables.m_DecayAlpha * ui_calculatedbm_variables.dbm;
-    ui_calculatedbm_variables.m_AttackAvedbmhz = (1.0 - ui_calculatedbm_variables.m_AttackAlpha) * ui_calculatedbm_variables.m_AttackAvedbmhz + ui_calculatedbm_variables.m_AttackAlpha * ui_calculatedbm_variables.dbmhz;
-    ui_calculatedbm_variables.m_DecayAvedbmhz = (1.0 - ui_calculatedbm_variables.m_DecayAlpha) * ui_calculatedbm_variables.m_DecayAvedbmhz + ui_calculatedbm_variables.m_DecayAlpha * ui_calculatedbm_variables.dbmhz;
+    ui_calculatedbm_variables.m_AttackAvedbm = (1.0f - ui_calculatedbm_variables.m_AttackAlpha) * ui_calculatedbm_variables.m_AttackAvedbm + ui_calculatedbm_variables.m_AttackAlpha * ui_calculatedbm_variables.dbm;
+    ui_calculatedbm_variables.m_DecayAvedbm = (1.0f - ui_calculatedbm_variables.m_DecayAlpha) * ui_calculatedbm_variables.m_DecayAvedbm + ui_calculatedbm_variables.m_DecayAlpha * ui_calculatedbm_variables.dbm;
+    ui_calculatedbm_variables.m_AttackAvedbmhz = (1.0f - ui_calculatedbm_variables.m_AttackAlpha) * ui_calculatedbm_variables.m_AttackAvedbmhz + ui_calculatedbm_variables.m_AttackAlpha * ui_calculatedbm_variables.dbmhz;
+    ui_calculatedbm_variables.m_DecayAvedbmhz = (1.0f - ui_calculatedbm_variables.m_DecayAlpha) * ui_calculatedbm_variables.m_DecayAvedbmhz + ui_calculatedbm_variables.m_DecayAlpha * ui_calculatedbm_variables.dbmhz;
 
     if (ui_calculatedbm_variables.m_AttackAvedbm > ui_calculatedbm_variables.m_DecayAvedbm)
     {                                                                                         // if attack average is larger then it must be an increasing signal

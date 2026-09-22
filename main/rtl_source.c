@@ -56,8 +56,19 @@ static struct {
     iq16_t *ring;
     uint32_t head;                                  /* written by delivery task       */
     uint32_t tail;                                  /* written by SDR task            */
-    uint32_t arr_seq;                               /* seqlock for (head, arr_t_us)   */
-    int64_t  arr_t_us;                              /* time the last block was pushed */
+    /*
+     * Arrival time of the block that made up the current head, truncated to 32 bits
+     * (microseconds since boot). A plain 64-bit int64_t is not atomic on this 32-bit
+     * target, and an earlier version paired it with `head` via a seqlock; that let the
+     * reader (sdrTask, prio 20) livelock the writer (the driver's delivery task, prio
+     * 18 - both pinned to core 1) by spinning on the lock without ever yielding, which
+     * starved IDLE1 and tripped the task watchdog. A 32-bit timestamp needs no lock:
+     * plain store here, ordered by the release-store of `head` right after it; plain
+     * load on the read side, ordered by the acquire-load of `head` right before it.
+     * The two can very rarely be one block apart (a torn "snapshot"), which the rate
+     * controller's smoothing absorbs without effect; that trade-off is deliberate.
+     */
+    uint32_t arr_t_us32;
     volatile bool primed;
 
     volatile TaskHandle_t reader;
@@ -65,6 +76,7 @@ static struct {
 
     volatile bool streaming;
     volatile bool fault;
+
 
     volatile uint32_t want_lo_hz;
     volatile bool     lo_pending;
@@ -104,13 +116,10 @@ static void process_block(const uint8_t *data, size_t bytes)
         head += (uint32_t)nf;
     }
 
-    /* Publish head together with its arrival time (seqlock, single writer) */
-    const uint32_t s = S.arr_seq;
-    __atomic_store_n(&S.arr_seq, s + 1, __ATOMIC_RELAXED);
-    __atomic_thread_fence(__ATOMIC_RELEASE);
-    S.arr_t_us = esp_timer_get_time();
+    /* Publish the arrival time before head: the release-store below makes both visible
+     * together to any reader that does an acquire-load of head (see the field comment). */
+    S.arr_t_us32 = (uint32_t)esp_timer_get_time();
     __atomic_store_n(&S.head, head, __ATOMIC_RELEASE);
-    __atomic_store_n(&S.arr_seq, s + 2, __ATOMIC_RELEASE);
 
     TaskHandle_t r = S.reader;
     if (r != NULL) {
@@ -368,16 +377,11 @@ esp_err_t rtl_source_read_float(float *i, float *q, size_t frames, uint32_t time
         ulTaskNotifyTake(pdTRUE, tmo - elapsed);
     }
 
-    /* Consistent (head, arrival time) snapshot */
-    uint32_t head, s1, s2;
-    int64_t t_arr;
-    do {
-        s1 = __atomic_load_n(&S.arr_seq, __ATOMIC_ACQUIRE);
-        head = __atomic_load_n(&S.head, __ATOMIC_RELAXED);
-        t_arr = S.arr_t_us;
-        __atomic_thread_fence(__ATOMIC_ACQUIRE);
-        s2 = __atomic_load_n(&S.arr_seq, __ATOMIC_RELAXED);
-    } while ((s1 & 1u) || s1 != s2);
+    /* head, then its arrival time: the acquire-load of head orders this after the
+     * writer's plain store of arr_t_us32, so the pair is consistent (see the field
+     * comment) with no lock and no possibility of spinning. */
+    const uint32_t head = __atomic_load_n(&S.head, __ATOMIC_ACQUIRE);
+    const uint32_t t_arr32 = S.arr_t_us32;
 
     uint32_t tail = S.tail;
 
@@ -389,7 +393,8 @@ esp_err_t rtl_source_read_float(float *i, float *q, size_t frames, uint32_t time
         rtl_rate_ctl_reset(&S.rc);
     }
 
-    const float level = rtl_level_estimate(head - tail, esp_timer_get_time() - t_arr);
+    const uint32_t now32 = (uint32_t)esp_timer_get_time();
+    const float level = rtl_level_estimate(head - tail, (int64_t)(now32 - t_arr32)); /* wraps correctly: both are the low 32 bits of the same clock, and the gap is always well under 2^31 us */
     S.step_req = rtl_rate_ctl_update(&S.rc, level, true);
 
     const float k = 1.0f / (float)INT16_MAX;

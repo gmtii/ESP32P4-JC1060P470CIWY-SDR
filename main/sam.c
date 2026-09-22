@@ -185,7 +185,7 @@ void SAM(float *i_sample_out, float *q_sample_out, float *demod_out, int BUFFER_
         // wrap round 2PI, modulus
         while (sam_variables.phzerror >= TPI)
             sam_variables.phzerror -= TPI;
-        while (sam_variables.phzerror < 0.0)
+        while (sam_variables.phzerror < 0.0f)
             sam_variables.phzerror += TPI;
     }
     // SAM_carrier = 0.08 * (omega2 * SAMPLERATE / (DF * TPI);

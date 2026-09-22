@@ -59,7 +59,7 @@ void IRAM_ATTR NR(float *demod_out_d, const int BUFFER_SIZE, int ANR_on)
                 y += ANR_w[j] * ANR_d[idx];
                 sigma += ANR_d[idx] * ANR_d[idx];
             }
-            inv_sigp = 1.0 / (sigma + 1e-10);
+            inv_sigp = 1.0f / (sigma + 1e-10f);
             error = ANR_d[ANR_in_idx] - y;
 
             if (ANR_on == 1)
@@ -67,9 +67,9 @@ void IRAM_ATTR NR(float *demod_out_d, const int BUFFER_SIZE, int ANR_on)
             else
                 demod_out_d[i] = y; // NOISE REDUCTION
 
-            if ((nel = error * (1.0 - ANR_two_mu * sigma * inv_sigp)) < 0.0)
+            if ((nel = error * (1.0f - ANR_two_mu * sigma * inv_sigp)) < 0.0f)
                 nel = -nel;
-            if ((nev = ANR_d[ANR_in_idx] - (1.0 - ANR_two_mu * ANR_ngamma) * y - ANR_two_mu * error * sigma * inv_sigp) < 0.0)
+            if ((nev = ANR_d[ANR_in_idx] - (1.0f - ANR_two_mu * ANR_ngamma) * y - ANR_two_mu * error * sigma * inv_sigp) < 0.0f)
                 nev = -nev;
             if (nev < nel)
             {
@@ -80,7 +80,7 @@ void IRAM_ATTR NR(float *demod_out_d, const int BUFFER_SIZE, int ANR_on)
             }
             ANR_ngamma = ANR_gamma * (ANR_lidx * ANR_lidx) * (ANR_lidx * ANR_lidx) * ANR_den_mult;
 
-            c0 = 1.0 - ANR_two_mu * ANR_ngamma;
+            c0 = 1.0f - ANR_two_mu * ANR_ngamma;
             c1 = ANR_two_mu * error * inv_sigp;
 
             for (j = 0; j < ANR_taps; j++)
