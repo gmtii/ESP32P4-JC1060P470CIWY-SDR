@@ -32,6 +32,38 @@ extern VFO currentVFO;
 
 static char *TAG = "UI";
 
+/*
+ * Screen layout - reworked per Jorge, DeepSDR-inspired: S-meter/frequency/mode block
+ * top-left, a single badge row (was 3 stacked rows), a clock top-right corner
+ * (placeholder - see label_clock's comment), and the demod/filter/step controls
+ * moved below the waterfall instead of overlapping the top info block. Panel is
+ * 1024x600 (WAVEFORM_WIDTH x the literal 600 already used throughout this file for
+ * the waveform/waterfall's own vertical placement).
+ *
+ * UI_SPECTRUM_TOP_Y replaces the previous bare "600 - WATERFALL_HEIGHT -
+ * WAVEFORM_HEIGHT" (which put the waterfall flush against the bottom edge, leaving
+ * no room below it) - same total spectrum+waterfall height (320 px, WAVEFORM_HEIGHT
+ * + WATERFALL_HEIGHT), just shifted up by UI_BUTTON_ROW_H to free a strip at the
+ * bottom for the control buttons. Neither WAVEFORM_HEIGHT nor WATERFALL_HEIGHT
+ * themselves change, so none of the buffer/DSP sizing code that depends on them
+ * elsewhere is affected - this is a pure repositioning.
+ */
+#define UI_BUTTON_ROW_H 80 /* was 60: taller (70 px) buttons now, see UI_CTRL_BTN_H */
+#define UI_CTRL_BTN_W 150
+#define UI_CTRL_BTN_H 70
+#define UI_CTRL_BTN_GAP 20
+#define UI_SPECTRUM_TOP_Y (600 - UI_BUTTON_ROW_H - WATERFALL_HEIGHT - WAVEFORM_HEIGHT)
+
+/* Top-left info block (S-meter is 335x125, at its usual 0,0): frequency and mode
+ * text sit to its right, roughly matching the S-meter's own vertical span. */
+#define UI_FREQ_X 360
+#define UI_FREQ_Y 15
+#define UI_MODE_X 360
+#define UI_MODE_Y 90
+#define UI_BADGE_ROW_Y 140 /* single row, right below the info block */
+#define UI_CLOCK_X_MARGIN 10
+#define UI_CLOCK_Y 10
+
 #define SMETER_MIN_ANGLE 135 // grados
 #define SMETER_MAX_ANGLE 405 // grados
 #define SMETER_RANGE 270     // arco total
@@ -101,21 +133,33 @@ static void desbloquear_cb(lv_timer_t *timer)
   ESP_LOGI(TAG, "Debounce...");
 }
 
+/* Actual label update, with NO locking of its own: safe to call only from a context
+ * that already holds the LVGL lock (an LVGL event callback, like spectrum_drag_cb -
+ * that's the whole point) or doesn't need it (see refresca_VFO() below for everyone
+ * else). Calling lvgl_port_lock() a second time from a context that already holds it
+ * (as an event callback always does, since LVGL's own dispatcher holds the lock while
+ * running callbacks) would self-deadlock the LVGL task - freezing the whole screen,
+ * spectrum included, since its own redraw timer can then never run again. */
+static void update_vfo_label(void)
+{
+  lv_label_set_text_fmt(freq_label, "%d%d.%d%d%d.%d%d%d",
+                        (currentVFO.Frec % 100000000) / 10000000,
+                        (currentVFO.Frec % 10000000) / 1000000,
+                        (currentVFO.Frec % 1000000) / 100000,
+                        (currentVFO.Frec % 100000) / 10000,
+                        (currentVFO.Frec % 10000) / 1000,
+                        (currentVFO.Frec % 1000) / 100,
+                        (currentVFO.Frec % 100) / 10,
+                        (currentVFO.Frec % 10) / 1);
+}
+
+/* For callers OUTSIDE the LVGL context (e.g. tarea_encoder, a plain FreeRTOS task):
+ * takes the lock itself, since nothing else holds it there. */
 void refresca_VFO(void)
 {
-  // Proteger LVGL si usas esp_lvgl_port
   if (lvgl_port_lock(0))
   {
-    lv_label_set_text_fmt(freq_label, "%d%d%d.%d%d%d.%d%d%d",
-                          (currentVFO.Frec % 1000000000) / 100000000,
-                          (currentVFO.Frec % 100000000) / 10000000,
-                          (currentVFO.Frec % 10000000) / 1000000,
-                          (currentVFO.Frec % 1000000) / 100000,
-                          (currentVFO.Frec % 100000) / 10000,
-                          (currentVFO.Frec % 10000) / 1000,
-                          (currentVFO.Frec % 1000) / 100,
-                          (currentVFO.Frec % 100) / 10,
-                          (currentVFO.Frec % 10) / 1);
+    update_vfo_label();
     lvgl_port_unlock();
   }
 }
@@ -159,6 +203,16 @@ void timer_dibuja_pantalla(lv_timer_t *timer)
       lvgl_port_unlock();
     }
   }
+}
+
+/* Placeholder clock: uptime since boot. See label_clock's comment at creation
+ * for what replaces this once the real RTC/NTP source is wired up. */
+void timer_clock_update(lv_timer_t *timer)
+{
+  (void)timer;
+  int64_t s = esp_timer_get_time() / 1000000;
+  lv_label_set_text_fmt(label_clock, "%02d:%02d:%02d",
+                        (int)((s / 3600) % 100), (int)((s / 60) % 60), (int)(s % 60));
 }
 
 void timer_smeter_update(lv_timer_t *timer)
@@ -472,65 +526,78 @@ void btn_event_cb(lv_event_t *e)
   }
 }
 
+/*
+ * Shared look for the bottom control buttons: bigger, rounded, blue vertical
+ * gradient (per Jorge's ESPHome-style reference photo), replacing the previous
+ * small flat dark-gray 70x50 buttons.
+ */
+static void style_ctrl_button(lv_obj_t *btn)
+{
+  lv_obj_set_size(btn, UI_CTRL_BTN_W, UI_CTRL_BTN_H);
+  lv_obj_set_style_radius(btn, 14, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(btn, lv_color_hex(0x3d8fe0), LV_PART_MAIN);
+  lv_obj_set_style_bg_grad_color(btn, lv_color_hex(0x0d4a8f), LV_PART_MAIN);
+  lv_obj_set_style_bg_grad_dir(btn, LV_GRAD_DIR_VER, LV_PART_MAIN);
+  lv_obj_set_style_border_width(btn, 2, LV_PART_MAIN);
+  lv_obj_set_style_border_color(btn, lv_color_hex(0x1a5aa0), LV_PART_MAIN);
+  lv_obj_add_event_cb(btn, btn_event_cb, LV_EVENT_CLICKED, NULL);
+}
+
+/* Small dimmed name label (top half) + a bigger value label (bottom half), both
+ * inside the same button - "MODE" / "USB", "FILTER" / "2k3", "STEP" / "1000",
+ * matching the reference layout. *out_value is the label callers update later
+ * (label_modos/label_filtros/label_step already did that; only their creation
+ * and position changes here). MENU has no second line - it is an action, not a
+ * value display - so its own block below skips this helper's name/value split. */
+static lv_obj_t *add_name_value_labels(lv_obj_t *btn, const char *name, lv_obj_t **out_value)
+{
+  lv_obj_t *name_lbl = lv_label_create(btn);
+  lv_label_set_text(name_lbl, name);
+  lv_obj_set_style_text_color(name_lbl, lv_color_hex(0xBFD9F5), LV_PART_MAIN);
+  lv_obj_align(name_lbl, LV_ALIGN_TOP_MID, 0, 6);
+
+  lv_obj_t *value_lbl = lv_label_create(btn);
+  lv_obj_set_style_text_color(value_lbl, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
+  lv_obj_align(value_lbl, LV_ALIGN_BOTTOM_MID, 0, -6);
+
+  *out_value = value_lbl;
+  return name_lbl;
+}
+
 void dibuja_botones(void)
 {
-  /* --- Botón Menu--- */
+  /* --- Botón Menu (action button: single centered label, no value line) --- */
   btn_menu = lv_btn_create(screen);
-  lv_obj_set_size(btn_menu, 70, 50);
-
-  lv_obj_align(btn_menu, LV_ALIGN_LEFT_MID, 10, -125); // margen de 10 px desde el borde
-
-  // lv_obj_set_pos(btn_menu, 10, smeter2.header.h + 10);
-  lv_obj_add_event_cb(btn_menu, btn_event_cb, LV_EVENT_CLICKED, NULL);
-
-  lv_obj_set_style_bg_color(btn_menu, lv_color_hex(0x202020), LV_PART_MAIN);
-  lv_obj_set_style_border_color(btn_menu, lv_color_hex(0x404040), LV_PART_MAIN);
+  style_ctrl_button(btn_menu);
+  lv_obj_align(btn_menu, LV_ALIGN_BOTTOM_LEFT, 10, -10);
 
   label_menu = lv_label_create(btn_menu);
   lv_label_set_text(label_menu, "MENU");
   lv_obj_center(label_menu);
 
-  /* --- Botón Modos--- */
+  /* --- Botón Modos: "MODE" / current demod mode --- */
   btn_modos = lv_btn_create(screen);
-  lv_obj_set_size(btn_modos, 70, 50);
-  lv_obj_align(btn_modos, LV_ALIGN_LEFT_MID, 90, -125); // margen de 10 px desde el borde
+  style_ctrl_button(btn_modos);
+  lv_obj_align(btn_modos, LV_ALIGN_BOTTOM_LEFT, 10 + (UI_CTRL_BTN_W + UI_CTRL_BTN_GAP), -10);
 
-  lv_obj_add_event_cb(btn_modos, btn_event_cb, LV_EVENT_CLICKED, NULL);
-
-  lv_obj_set_style_bg_color(btn_modos, lv_color_hex(0x202020), LV_PART_MAIN);
-  lv_obj_set_style_border_color(btn_modos, lv_color_hex(0x404040), LV_PART_MAIN);
-
-  label_modos = lv_label_create(btn_modos);
+  add_name_value_labels(btn_modos, "MODE", &label_modos);
   lv_label_set_text_fmt(label_modos, "%s", demod_modos_texto[demod_modo]);
-  lv_obj_center(label_modos);
 
-  /* --- Botón Filtros--- */
+  /* --- Botón Filtros: "FILTER" / current filter width --- */
   btn_filtros = lv_btn_create(screen);
-  lv_obj_set_size(btn_filtros, 70, 50);
-  lv_obj_align(btn_filtros, LV_ALIGN_LEFT_MID, 170, -125); // margen de 10 px desde el borde
+  style_ctrl_button(btn_filtros);
+  lv_obj_align(btn_filtros, LV_ALIGN_BOTTOM_LEFT, 10 + 2 * (UI_CTRL_BTN_W + UI_CTRL_BTN_GAP), -10);
 
-  lv_obj_add_event_cb(btn_filtros, btn_event_cb, LV_EVENT_CLICKED, NULL);
-
-  lv_obj_set_style_bg_color(btn_filtros, lv_color_hex(0x202020), LV_PART_MAIN);
-  lv_obj_set_style_border_color(btn_filtros, lv_color_hex(0x404040), LV_PART_MAIN);
-
-  label_filtros = lv_label_create(btn_filtros);
+  add_name_value_labels(btn_filtros, "FILTER", &label_filtros);
   lv_label_set_text_fmt(label_filtros, "%s", filtros_texto[filtro_indice]);
-  lv_obj_center(label_filtros);
 
-  /* --- Botón Step--- */
+  /* --- Botón Step: "STEP" / current step value --- */
   btn_step = lv_btn_create(screen);
-  lv_obj_set_size(btn_step, 70, 50);
-  lv_obj_align(btn_step, LV_ALIGN_LEFT_MID, 250, -125); // margen de 10 px desde el borde
+  style_ctrl_button(btn_step);
+  lv_obj_align(btn_step, LV_ALIGN_BOTTOM_LEFT, 10 + 3 * (UI_CTRL_BTN_W + UI_CTRL_BTN_GAP), -10);
 
-  lv_obj_add_event_cb(btn_step, btn_event_cb, LV_EVENT_CLICKED, NULL);
-
-  lv_obj_set_style_bg_color(btn_step, lv_color_hex(0x202020), LV_PART_MAIN);
-  lv_obj_set_style_border_color(btn_step, lv_color_hex(0x404040), LV_PART_MAIN);
-
-  label_step = lv_label_create(btn_step);
+  add_name_value_labels(btn_step, "STEP", &label_step);
   lv_label_set_text_fmt(label_step, "%d", pasos[pasos_indice]);
-  lv_obj_center(label_step);
 
   return;
 
@@ -601,6 +668,121 @@ void dibuja_botones(void)
   lv_obj_center(label_vol);
 }
 
+/*
+ * Drag left/right on the spectrum to change the VFO by whole multiples of the
+ * current step (same pasos[]/pasos_indice the encoder and the step button use),
+ * one step per SPECTRUM_DRAG_PX_PER_STEP pixels of horizontal movement - a
+ * touchscreen equivalent of turning the encoder. Only horizontal movement is
+ * tracked (no proportional/absolute frequency-from-x-position mapping), and a
+ * short tap that doesn't reach one step's worth of movement changes nothing,
+ * so this doesn't interfere with tapping elsewhere on the screen.
+ *
+ * Deliberately on waveform_canvas (the spectrum), not waterfall_canvas: the
+ * latter already opens the menu on tap (see btn_event_cb), and keeping the two
+ * canvases' touch behaviour separate avoids any conflict between them.
+ */
+#define SPECTRUM_DRAG_PX_PER_STEP 15 /* pixels per step; a starting value, adjust to taste on real hardware */
+
+/*
+ * Minimum time between actual RF retunes triggered by dragging. NOT about LVGL or
+ * rendering (see the long comment below) - the ONLY thing this throttles is how
+ * often rtl_source_set_freq() reaches the hardware; the on-screen frequency and
+ * currentVFO.Frec update on every step regardless, so the drag still feels live.
+ *
+ * *** WHY THIS EXISTS - diagnosed 2026-09-22, per Jorge's own observation that the
+ * WATERFALL KEPT SCROLLING but with the SAME (stale) data repeating while dragging,
+ * resuming the instant the drag stopped. That ruled out an LVGL/rendering freeze
+ * (three earlier attempts at that theory - a locking deadlock, an implicit LVGL
+ * scroll gesture, and default press-state styling - were each real, worth having
+ * fixed, but NONE of them were this bug). The actual cause, confirmed against
+ * esp_rtl_sdr's own source: retune_hz(), called from an app task (this project's
+ * rtl_source.c control task) as opposed to the driver's own event-callback context,
+ * PAUSES AND DRAINS the USB bulk pipeline, applies the new LO over EP0, then
+ * resubmits - a real, intentional stop-and-resume of the I/Q data stream every
+ * single time, not a cheap register poke. rtl_source_set_freq() coalesces bursts
+ * (only the latest requested frequency survives if several arrive before the
+ * control task gets to them), but that only bounds the number of PHYSICAL retunes,
+ * not how much of a fast, continuous drag's duration they eat: a quick swipe can
+ * cross many step boundaries a second, keeping the control task busy pausing and
+ * resuming the pipeline back-to-back for the whole gesture, so sdrTask's own
+ * rtl_source_read_float() keeps timing out and - by design (see its ESP_ERR_TIMEOUT
+ * path in sdr.c) - skips refreshing i_fft/q_fft on every failed read, so
+ * calcula_fft() keeps re-computing the SAME stale frame. Nothing here is unique to
+ * touch: the encoder drives the exact same rtl_source_set_freq() call per detent
+ * and was never reported doing this, simply because a human turning a knob can't
+ * generate anywhere close to the retune rate a fast finger swipe can - this
+ * throttle just brings touch dragging down to a similarly gentle retune rate.
+ */
+#define SPECTRUM_DRAG_RETUNE_MIN_US 80000 /* ~12.5 Hz max actual retune rate; a starting value, not measured against how long a real retune here takes to drain+resubmit - raise it if the freeze is still visible, lower it if retuning feels laggy */
+
+static void spectrum_drag_apply_freq(void)
+{
+  rtl_source_set_freq(currentVFO.Frec - lo_offset_for_mode(demod_modo));
+}
+
+static void spectrum_drag_cb(lv_event_t *e)
+{
+  static lv_point_t last_point;
+  static int32_t drag_accum_px = 0;
+  static int64_t last_retune_us = 0;
+  static bool retune_pending = false;
+
+  lv_indev_t *indev = lv_indev_get_act();
+  if (indev == NULL)
+    return;
+
+  lv_point_t p;
+  lv_indev_get_point(indev, &p);
+
+  const lv_event_code_t code = lv_event_get_code(e);
+
+  if (code == LV_EVENT_PRESSED)
+  {
+    last_point = p;
+    drag_accum_px = 0;
+    retune_pending = false;
+    return;
+  }
+
+  if (code == LV_EVENT_RELEASED)
+  {
+    /* Always flush on release: a throttled-away retune from the last few steps of
+     * the drag must still land, or the hardware could be left tuned a few steps
+     * short of what the screen shows. */
+    if (retune_pending)
+    {
+      spectrum_drag_apply_freq();
+      retune_pending = false;
+    }
+    return;
+  }
+
+  drag_accum_px += (p.x - last_point.x);
+  last_point = p;
+
+  int32_t steps = drag_accum_px / SPECTRUM_DRAG_PX_PER_STEP;
+  if (steps == 0)
+    return;
+  drag_accum_px -= steps * SPECTRUM_DRAG_PX_PER_STEP;
+
+  currentVFO.Frec -= steps * pasos[pasos_indice]; /* inverted from the encoder's "+=": drag right now lowers frequency */
+  update_vfo_label(); /* NOT refresca_VFO(): already inside an LVGL callback, see its comment */
+
+  const int64_t now_us = esp_timer_get_time();
+  if (now_us - last_retune_us >= SPECTRUM_DRAG_RETUNE_MIN_US)
+  {
+    spectrum_drag_apply_freq();
+    last_retune_us = now_us;
+    retune_pending = false;
+  }
+  else
+  {
+    /* Coalesced by rtl_source_set_freq() itself if a throttled window opens before
+     * the next step - flushed for certain on LV_EVENT_RELEASED either way. */
+    retune_pending = true;
+  }
+}
+
 static void encoder_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
 {
   data->enc_diff = s_enc_diff; // entregar Δ acumulado a LVGL
@@ -638,38 +820,67 @@ void tarea_encoder(void *arg)
   }
 }
 
+/*
+ * "Classic" palette, exact stops from SDR++'s own root/res/colormaps/classic.json
+ * (author: Youssef Touil) - dark navy -> blues -> white -> yellow -> orange -> red
+ * -> dark red. Replaces the previous 4-segment synthetic gradient (a hand-picked
+ * blue/cyan/green/yellow/red ramp, not from SDR++) with the real thing, per Jorge.
+ *
+ * Built into a 256-entry LUT once at startup (palette_lut_init(), called from
+ * init_ui()) rather than interpolated per call: fft_color_map() is called once per
+ * lit pixel in both spectrum() and waterfall_update(), the hottest path in the UI
+ * (a sibling GD32F450 SDR project's own spectrum.h documents the same lesson: a
+ * float colormap function with divisions/branches, called per-pixel, dominates
+ * frame time over the actual pixel writes). A LUT lookup replaces the previous
+ * 4-branch/2-multiply version with a single array read - strictly cheaper too.
+ */
+static const uint8_t k_palette_classic_stops[15][3] = {
+    {0, 0, 32}, {0, 0, 48}, {0, 0, 80}, {0, 0, 145}, {30, 144, 255},
+    {255, 255, 255}, {255, 255, 0}, {254, 109, 22}, {254, 109, 22},
+    {255, 0, 0}, {255, 0, 0}, {198, 0, 0}, {159, 0, 0}, {117, 0, 0}, {74, 0, 0},
+};
+
+static uint16_t palette_lerp_stops(const uint8_t stops[][3], uint8_t n_stops, float t)
+{
+  float pos, u;
+  uint8_t i0, i1, r, g, b;
+
+  if (t < 0.0f) t = 0.0f;
+  if (t > 1.0f) t = 1.0f;
+
+  pos = t * (float)(n_stops - 1U);
+  i0 = (uint8_t)pos;
+  if (i0 > (uint8_t)(n_stops - 2U)) i0 = (uint8_t)(n_stops - 2U); /* guards the t=1.0 exact-edge case */
+  i1 = (uint8_t)(i0 + 1U);
+  u = pos - (float)i0;
+
+  r = (uint8_t)((float)stops[i0][0] + u * ((float)stops[i1][0] - (float)stops[i0][0]));
+  g = (uint8_t)((float)stops[i0][1] + u * ((float)stops[i1][1] - (float)stops[i0][1]));
+  b = (uint8_t)((float)stops[i0][2] + u * ((float)stops[i1][2] - (float)stops[i0][2]));
+
+  return (uint16_t)(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
+}
+
+static uint16_t s_palette_lut[256];
+static bool s_palette_lut_ready = false;
+
+static void palette_lut_init(void)
+{
+  int i;
+  for (i = 0; i < 256; i++)
+  {
+    s_palette_lut[i] = palette_lerp_stops(k_palette_classic_stops, 15U, (float)i * (1.0f / 255.0f));
+  }
+  s_palette_lut_ready = true;
+}
+
 uint16_t fft_color_map(uint8_t v)
 {
-  uint8_t r, g, b;
-
-  if (v < 64)
+  if (!s_palette_lut_ready)
   {
-    r = 0;
-    g = 0;
-    b = v * 4;
+    palette_lut_init(); /* safety net: normally already built by init_ui() */
   }
-  else if (v < 128)
-  {
-    r = 0;
-    g = (v - 64) * 4;
-    b = 255;
-  }
-  else if (v < 192)
-  {
-    r = (v - 128) * 4;
-    g = 255;
-    b = 255 - (v - 128) * 4;
-  }
-  else
-  {
-    r = 255;
-    g = 255 - (v - 192) * 4;
-    b = 0;
-  }
-
-  return ((r & 0xF8) << 8) |
-         ((g & 0xFC) << 3) |
-         (b >> 3);
+  return s_palette_lut[v];
 }
 
 void waterfall_update(void)
@@ -700,6 +911,8 @@ void waterfall_update(void)
 
 void init_ui()
 {
+  palette_lut_init();
+
   /* Obtén la pantalla activa */
   screen = lv_scr_act();
 
@@ -714,6 +927,12 @@ void init_ui()
   dibuja_botones();
 
   waveform_canvas = lv_canvas_create(screen);
+  /* Same treatment `screen` already gets: strips the active theme's default styling,
+   * including whatever it applies for LV_STATE_PRESSED (commonly a bg/opa or outline
+   * change on any clickable object). Without this, touching the canvas visually
+   * "freezes" it immediately - not a real stall, just the theme's press-feedback
+   * overlay covering the live spectrum until release reverts the state. */
+  lv_obj_remove_style_all(waveform_canvas);
   waveformbuffer = heap_caps_malloc(
       WAVEFORM_WIDTH * WAVEFORM_HEIGHT * sizeof(uint16_t), MALLOC_CAP_SPIRAM);
   memset(waveformbuffer, 0x00, WAVEFORM_WIDTH * WAVEFORM_HEIGHT * sizeof(uint16_t)); // índice 0 (negro)
@@ -735,7 +954,7 @@ void init_ui()
 
   // POSICION DE LOS CANVAS DE WATERFALL Y ESPECTRO!!!
 
-  lv_obj_set_pos(waveform_canvas, 0, 600 - WATERFALL_HEIGHT - WAVEFORM_HEIGHT);
+  lv_obj_set_pos(waveform_canvas, 0, UI_SPECTRUM_TOP_Y);
   lv_obj_align_to(waterfall_canvas, waveform_canvas, LV_ALIGN_OUT_BOTTOM_MID, 0, 0);
 
   // Borde y fondo
@@ -753,6 +972,18 @@ void init_ui()
   lv_obj_add_flag(waterfall_canvas, LV_OBJ_FLAG_CLICKABLE);
   lv_obj_add_event_cb(waterfall_canvas, btn_event_cb, LV_EVENT_CLICKED, NULL);
 
+  lv_obj_add_flag(waveform_canvas, LV_OBJ_FLAG_CLICKABLE);
+  /* LVGL objects are scrollable by default; without removing that, a drag on a
+   * clickable object is captured as an object-scroll gesture, and LVGL's own
+   * scroll handling takes over the pointer until release - which looks exactly
+   * like "the spectrum stops updating while dragging, resumes on release" (it's
+   * not frozen: LVGL is just busy running its own scroll interaction instead of
+   * dispatching PRESSING to spectrum_drag_cb in the meantime). */
+  lv_obj_remove_flag(waveform_canvas, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_event_cb(waveform_canvas, spectrum_drag_cb, LV_EVENT_PRESSED, NULL);
+  lv_obj_add_event_cb(waveform_canvas, spectrum_drag_cb, LV_EVENT_PRESSING, NULL);
+  lv_obj_add_event_cb(waveform_canvas, spectrum_drag_cb, LV_EVENT_RELEASED, NULL);
+
   // ✅ Forzar actualización
   lv_obj_invalidate(waveform_canvas);
 
@@ -768,8 +999,8 @@ void init_ui()
   // Color verde
   lv_style_set_text_color(&style_freq, lv_color_hex(0x00FF00));
 
-  // Posición opcional
-  lv_obj_align(freq_label, LV_ALIGN_BOTTOM_RIGHT, -10, -550);
+  // Posición: bloque superior izquierdo, junto al S-meter (was BOTTOM_RIGHT,-10,-550)
+  lv_obj_align(freq_label, LV_ALIGN_TOP_LEFT, UI_FREQ_X, UI_FREQ_Y);
 
   lv_obj_add_flag(freq_label, LV_OBJ_FLAG_CLICKABLE);
   lv_obj_add_event_cb(freq_label, freq_label_event_cb, LV_EVENT_CLICKED, NULL);
@@ -777,12 +1008,31 @@ void init_ui()
 
   refresca_VFO();
 
+  /* Mode text, top-left info block (plain label, not a button - the actual
+   * mode-cycle control is btn_modos, now down in the bottom button row).
+   * Kept in sync from refresca_indicadores(), which every mode-changing
+   * callback already calls. */
+  label_modo_info = lv_label_create(screen);
+  lv_obj_add_style(label_modo_info, &style_freq, LV_STATE_DEFAULT); /* same font/color as freq_label */
+  lv_obj_align(label_modo_info, LV_ALIGN_TOP_LEFT, UI_MODE_X, UI_MODE_Y);
+  lv_label_set_text(label_modo_info, "");
+
+  /* Clock, top-right corner. PLACEHOLDER: shows uptime since boot (HH:MM:SS), not
+   * wall-clock time - Jorge has both an external RTC and a WiFi (ESP32-C6
+   * companion) module available, but wiring either up is deliberately deferred
+   * until after this layout pass. Swap timer_clock_cb's body for a real
+   * time-of-day read once that's in place; nothing else here needs to change. */
+  label_clock = lv_label_create(screen);
+  lv_obj_align(label_clock, LV_ALIGN_TOP_RIGHT, -UI_CLOCK_X_MARGIN, UI_CLOCK_Y);
+  lv_label_set_text(label_clock, "00:00:00");
+
   /* TIMERS
    */
 
   timer_pantalla = lv_timer_create(timer_dibuja_pantalla, 33, NULL);
   // timer_cpu = lv_timer_create(timer_uso_cpu, 1000, NULL);
   timer_smeter = lv_timer_create(timer_smeter_update, 33, NULL);
+  timer_clock = lv_timer_create(timer_clock_update, 1000, NULL);
   // timer debounce 
   timer_debounce = lv_timer_create(desbloquear_cb, 300, NULL);
 
@@ -815,77 +1065,70 @@ void smeter_set_dbm(float dbm)
   if (dbm > SMETER_DBM_MAX)
     dbm = SMETER_DBM_MAX;
 
-  /* ESTA ES LA FÓRMULA CORRECTA */
-  float ratio = (dbm - SMETER_DBM_MIN) /
-                (SMETER_DBM_MAX - SMETER_DBM_MIN);
+  float ratio = (dbm - SMETER_DBM_MIN) / (SMETER_DBM_MAX - SMETER_DBM_MIN);
+  int lit = (int)(ratio * SMETER_N_SEGMENTS + 0.5f);
+  if (lit < 0)
+    lit = 0;
+  if (lit > SMETER_N_SEGMENTS)
+    lit = SMETER_N_SEGMENTS;
 
-  /* Mapear dBm → ángulo */
-  float angle_f =
-      SMETER_ANGLE_MIN +
-      ratio * (SMETER_ANGLE_MAX - SMETER_ANGLE_MIN);
-
-  int angle_deg = (int)angle_f;
-
-  /* lv_line_set_points() always invalidates the needle area (335x145 px here), even if the
-   * points did not change. Skip it while the needle stays on the same degree. */
-  static int last_angle_deg = -100000;
-  if (angle_deg == last_angle_deg)
+  /* Same guard the needle had: skip entirely (no style writes, no invalidation)
+   * while the lit count doesn't change. */
+  static int last_lit = -1;
+  if (lit == last_lit)
     return;
-  last_angle_deg = angle_deg;
+  last_lit = lit;
 
-  int32_t s = lv_trigo_sin(angle_deg);
-  int32_t c = lv_trigo_cos(angle_deg);
-
-  int32_t dx = (c * SMETER_NEEDLE_LEN) >> LV_TRIGO_SHIFT;
-  int32_t dy = (s * SMETER_NEEDLE_LEN) >> LV_TRIGO_SHIFT;
-
-  smeter.pts[0].x = SMETER_PIVOT_X;
-  smeter.pts[0].y = SMETER_PIVOT_Y;
-
-  smeter.pts[1].x = SMETER_PIVOT_X - dx;
-  smeter.pts[1].y = SMETER_PIVOT_Y - dy;
-
-  lv_line_set_points(smeter.needle, smeter.pts, 2);
-
-  // if (contador_printf++ > 25)
-  // {
-  //   printf("%f - angle: %f aguja: %d,%d -> %d,%d \n", dbm, angle_f, SMETER_PIVOT_X, SMETER_PIVOT_Y, smeter.pts[1].x, smeter.pts[1].y);
-  //   contador_printf = 0;
-  // }
+  for (int i = 0; i < SMETER_N_SEGMENTS; i++)
+  {
+    lv_color_t c;
+    if (i >= lit)
+      c = lv_color_hex(0x202020); /* unlit */
+    else if (i < SMETER_N_S9)
+      c = lv_color_hex(0x00C000); /* S1..S9 */
+    else
+      c = lv_color_hex(0xE02020); /* S9+10/20/30/40/60 */
+    lv_obj_set_style_bg_color(smeter_segments[i], c, 0);
+  }
 }
 
 void inicia_smeter_ui(void)
 {
-  /* 1. Crear contenedor del smeter */
+  /* Classic horizontal segment S-meter (was an analog needle over a ~82 KiB
+   * background image - see smeter_set_dbm()'s comment / ui_priv.h's segment
+   * defines for the full reasoning). Container sized to exactly fit the
+   * segment row; no image, no line object. */
   meter_cont = lv_obj_create(screen);
-  lv_obj_set_size(meter_cont, smeter2.header.w, smeter2.header.h);
-  lv_obj_set_style_pad_all(meter_cont, 0, 0);
-  lv_obj_set_style_border_width(meter_cont, 0, 0);
-
-  /* Activar CLIPPING */
-  lv_obj_set_scroll_dir(meter_cont, LV_DIR_NONE); // evita scroll
-  lv_obj_set_scrollbar_mode(meter_cont, LV_SCROLLBAR_MODE_OFF);
-
-  /* 2. Crear imagen del smeter dentro del contenedor */
-  meter_img = lv_img_create(meter_cont);
-  lv_img_set_src(meter_img, &smeter2);
-  lv_obj_set_pos(meter_img, 0, 0);
-
-  /* 3. Crear aguja como línea */
-  smeter.needle = lv_line_create(meter_cont);
-  lv_obj_set_size(smeter.needle, smeter2.header.w, smeter2.header.h + 20.);
-
-  /* Estilo de la aguja */
-  lv_obj_set_style_line_width(smeter.needle, 4, 0);
-  lv_obj_set_style_line_color(smeter.needle, lv_color_hex(0xff0000), 0);
-  lv_obj_set_style_line_rounded(smeter.needle, true, 0);
-
-  lv_obj_set_pos(smeter.needle, 0, 0);
-
+  /* remove_style_all() FIRST: in LVGL v9 width/height are style properties, so
+   * calling it AFTER lv_obj_set_size() wipes the size right back out. That was
+   * the actual bug behind the broken-looking meter on real hardware - the
+   * container silently reverted to LVGL's default object size, well short of
+   * the 322x30 px this was meant to be, clipping most of the segments and
+   * leaving what looked like an empty leftover frame (same border style as the
+   * old analog meter's, by coincidence, since I reused those exact values). */
+  lv_obj_remove_style_all(meter_cont);
+  lv_obj_set_size(meter_cont,
+                  SMETER_N_SEGMENTS * (SMETER_SEG_W + SMETER_SEG_GAP) - SMETER_SEG_GAP,
+                  SMETER_SEG_H);
+  lv_obj_set_style_bg_color(meter_cont, lv_color_hex(0x101010), 0);
+  lv_obj_set_style_bg_opa(meter_cont, LV_OPA_COVER, 0);
   lv_obj_set_style_border_width(meter_cont, 2, 0);
   lv_obj_set_style_border_color(meter_cont, lv_color_hex(0x999999), 0);
   lv_obj_set_style_radius(meter_cont, 6, 0);
-  lv_obj_set_style_pad_all(meter_cont, 0, 0);
+  lv_obj_set_style_pad_all(meter_cont, 4, 0);
+  lv_obj_set_scroll_dir(meter_cont, LV_DIR_NONE);
+  lv_obj_set_scrollbar_mode(meter_cont, LV_SCROLLBAR_MODE_OFF);
+
+  for (int i = 0; i < SMETER_N_SEGMENTS; i++)
+  {
+    smeter_segments[i] = lv_obj_create(meter_cont);
+    lv_obj_remove_style_all(smeter_segments[i]);
+    lv_obj_set_size(smeter_segments[i], SMETER_SEG_W, SMETER_SEG_H - 8);
+    lv_obj_set_pos(smeter_segments[i], i * (SMETER_SEG_W + SMETER_SEG_GAP), 0);
+    lv_obj_set_style_bg_opa(smeter_segments[i], LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_color(smeter_segments[i], lv_color_hex(0x202020), 0); /* unlit at startup */
+    lv_obj_set_style_radius(smeter_segments[i], 2, 0);
+  }
 }
 
 void dibuja_pasabanda(void)
@@ -899,22 +1142,22 @@ void dibuja_pasabanda(void)
     if (demod_modo == DEMOD_AM || demod_modo == DEMOD_SAM)
     {
       lv_obj_set_size(box_pasabanda, 2 * margen_alto, H);
-      lv_obj_set_pos(box_pasabanda, W - W / 4 - margen_alto, 600 - WATERFALL_HEIGHT - WAVEFORM_HEIGHT);
+      lv_obj_set_pos(box_pasabanda, W - W / 4 - margen_alto, UI_SPECTRUM_TOP_Y);
     }
     else if (demod_modo == DEMOD_USB || demod_modo == DEMOD_SAMU)
     {
       lv_obj_set_size(box_pasabanda, margen_alto, H);
-      lv_obj_set_pos(box_pasabanda, W - W / 4, 600 - WATERFALL_HEIGHT - WAVEFORM_HEIGHT);
+      lv_obj_set_pos(box_pasabanda, W - W / 4, UI_SPECTRUM_TOP_Y);
     }
     else if (demod_modo == DEMOD_LSB || demod_modo == DEMOD_SAML)
     {
       lv_obj_set_size(box_pasabanda, margen_alto, H);
-      lv_obj_set_pos(box_pasabanda, W - W / 4 - margen_alto, 600 - WATERFALL_HEIGHT - WAVEFORM_HEIGHT);
+      lv_obj_set_pos(box_pasabanda, W - W / 4 - margen_alto, UI_SPECTRUM_TOP_Y);
     }
     else if (demod_modo == DEMOD_FM || demod_modo == DEMOD_WFM)
     {
       lv_obj_set_size(box_pasabanda, 0, 0);
-      lv_obj_set_pos(box_pasabanda, W, 600 - WATERFALL_HEIGHT - WAVEFORM_HEIGHT);
+      lv_obj_set_pos(box_pasabanda, W, UI_SPECTRUM_TOP_Y);
     }
 
     lvgl_port_unlock();
@@ -972,20 +1215,18 @@ void indicadores_create(lv_obj_t *parent)
     lv_obj_add_style(indicadores[i], &st_red, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_add_style(indicadores[i], &st_green, LV_PART_MAIN | IND_VERDE_STATE);
 
-    // Pon aquí su geometría como tú quieras (ejemplo)
-    if (i < 5)
+    /* Single row (was 3 stacked rows of 5/5/2): badges 0-9 at 60 px, 10-11 (the
+     * filter width and AGC mode texts, longer strings) at 100 px, 10 px gaps
+     * throughout. Total width 920 px, comfortably inside the 1024 px panel.
+     * Sits right below the top-left info block (see UI_BADGE_ROW_Y). */
+    if (i < 10)
     {
-      lv_obj_set_pos(indicadores[i], 350 + i * 70, 0);
+      lv_obj_set_pos(indicadores[i], 10 + i * 70, UI_BADGE_ROW_Y);
       lv_obj_set_width(indicadores[i], 60);
     }
-    else if (i >= 5 && i < 10)
+    else
     {
-      lv_obj_set_pos(indicadores[i], 350 + (i - 5) * 70, 50);
-      lv_obj_set_width(indicadores[i], 60);
-    }
-    else if (i >= 10)
-    {
-      lv_obj_set_pos(indicadores[i], 350 + (i - 10) * 110, 100);
+      lv_obj_set_pos(indicadores[i], 710 + (i - 10) * 110, UI_BADGE_ROW_Y);
       lv_obj_set_width(indicadores[i], 100);
     }
 
@@ -1037,4 +1278,10 @@ void refresca_indicadores(void)
 
   indicador_update(10, filtros_texto[filtro_indice], true);
   indicador_update(11, agc_texto[agc_wdsp_conf.AGC_mode], true);
+
+  /* Top-left info block's plain mode text - see label_modo_info's creation comment. */
+  if (label_modo_info != NULL)
+  {
+    lv_label_set_text(label_modo_info, demod_modos_texto[demod_modo]);
+  }
 }

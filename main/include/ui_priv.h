@@ -39,6 +39,8 @@ extern "C"
 
     lv_obj_t *smeter_obj;
     lv_obj_t *freq_label;
+    lv_obj_t *label_modo_info; /* top-left info block: current demod mode, plain text (not a button) */
+    lv_obj_t *label_clock;     /* top-right corner: placeholder, uptime since boot until real RTC/NTP lands */
 
     lv_obj_t *label_modos;
     lv_obj_t *label_step;
@@ -54,12 +56,12 @@ extern "C"
 
     lv_obj_t *value_label;
 
-    static lv_obj_t *meter_img;
 
     static lv_obj_t *indicador;
 
     lv_timer_t *timer_pantalla;
     lv_timer_t *timer_smeter;
+    lv_timer_t *timer_clock;
     lv_timer_t *timer_cpu;
     lv_timer_t *timer_debounce;
 
@@ -139,14 +141,22 @@ extern "C"
 #define SMETER_ANGLE_MIN 40  // grados
 #define SMETER_ANGLE_MAX 140 // grados
 
-    typedef struct
-    {
-        lv_obj_t *cont;
-        lv_obj_t *needle;
-        lv_point_precise_t pts[2];
-    } smeter_t;
+/*
+ * Classic horizontal segment S-meter, replacing the analog needle-over-image
+ * widget (per Jorge): S1-S9 (green) then S9+10/20/30/40/60 (red), the standard
+ * ham-radio convention. Far cheaper than the needle: no ~82 KiB background image
+ * (that asset lived in flash/PSRAM-XIP, not RAM, but each needle move still
+ * invalidated and re-blitted a 335x145 px region under it); a segment update only
+ * touches small rectangles, and (like the needle before it) is skipped entirely
+ * when the lit count hasn't changed since the last call.
+ */
+#define SMETER_N_SEGMENTS 14
+#define SMETER_N_S9 9 /* segments 0..N_S9-1 are S1..S9 (green); the rest are S9+10/20/30/40/60 (red) */
+#define SMETER_SEG_W 20
+#define SMETER_SEG_H 30
+#define SMETER_SEG_GAP 3
 
-    smeter_t smeter;
+    lv_obj_t *smeter_segments[SMETER_N_SEGMENTS];
 
 #ifdef __cplusplus
 }

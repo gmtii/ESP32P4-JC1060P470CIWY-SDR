@@ -42,6 +42,8 @@ extern int pasos_indice;
 extern bool f_actualiza;
 extern int filtro_indice;
 extern char *filtros_texto[5];
+extern uint8_t spec_smooth_passes; /* "SPT" - see sdr_priv.h's comment */
+#define SPECTRUM_LINE_SMOOTH_MAX 5
 extern char *agc_texto[6];
 
 /* =========================================================
@@ -224,16 +226,26 @@ static void btn7_cb(lv_event_t *e)
         f_nrss = false;
 }
 
+/*
+ * "SPT" - spectrum spatial-line smoothing cycle (0..SPECTRUM_LINE_SMOOTH_MAX), per
+ * Jorge, ported from a sibling GD32F450 SDR project (see sdr_priv.h's
+ * spec_smooth_passes comment for the DSP side). Repurposed from this slot's old
+ * FILTRO job: main screen's own btn_filtros (ui.c) already does the exact same
+ * filtro_indice cycling, making this menu-grid copy redundant.
+ */
 static void btn8_cb(lv_event_t *e)
 {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED)
         return;
     var_btn8 = !var_btn8;
-    filtro_indice++;
-    if (filtro_indice > 4)
-        filtro_indice = 0;
-    f_actualiza = true;
-    dibuja_pasabanda();
+
+    spec_smooth_passes = (uint8_t)((spec_smooth_passes + 1U) % (SPECTRUM_LINE_SMOOTH_MAX + 1U));
+
+    lv_obj_t *lbl = lv_obj_get_child(btn8_filtro, 0);
+    if (lbl != NULL)
+    {
+        lv_label_set_text_fmt(lbl, "SPT %d", (int)spec_smooth_passes);
+    }
 }
 
 static void btn9_cb(lv_event_t *e)
@@ -250,12 +262,26 @@ static void btn9_cb(lv_event_t *e)
     AGC_prep();
 }
 
+/*
+ * NFM / WFM. Mirrors the dedicated FM button on the main screen (ui.c's btn4_cb):
+ * WFM tunes on-frequency (no 12 kHz offset) and defaults the tuner to AGC, since
+ * broadcast FM carriers are always strong; leaving it restores the RTL gain
+ * slider's manual value. Kept as two separate buttons here (rather than one
+ * toggle like ui.c's) since the menu has room and it avoids a relabelling step.
+ */
 static void btn10_cb(lv_event_t *e)
 {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED)
         return;
     var_btn10 = !var_btn10;
-    printf("BTN10 -> %d\n", var_btn10);
+
+    demod_modo = DEMOD_FM;
+    currentVFO.demod_modo = demod_modo;
+    rtl_source_set_freq(currentVFO.Frec - lo_offset_for_mode(demod_modo));
+    rtl_source_set_gain_db(var_slider2);
+
+    dibuja_pasabanda();
+    refresca_indicadores();
 }
 
 static void btn11_cb(lv_event_t *e)
@@ -263,7 +289,14 @@ static void btn11_cb(lv_event_t *e)
     if (lv_event_get_code(e) != LV_EVENT_CLICKED)
         return;
     var_btn11 = !var_btn11;
-    printf("BTN11 -> %d\n", var_btn11);
+
+    demod_modo = DEMOD_WFM;
+    currentVFO.demod_modo = demod_modo;
+    rtl_source_set_freq(currentVFO.Frec - lo_offset_for_mode(demod_modo));
+    rtl_source_set_gain_auto(true);
+
+    dibuja_pasabanda();
+    refresca_indicadores();
 }
 
 /* =========================================================
@@ -431,10 +464,22 @@ void ui_create_control_panel(void)
     btn6_saml = create_button(grid_btns, "SAML", btn6_cb);
 
     btn7_nr = create_button(grid_btns, "NR", btn7_cb);
-    btn8_filtro = create_button(grid_btns, "FILTRO", btn8_cb);
+    {
+        /* The menu grid is destroyed and rebuilt from scratch every time it's
+         * closed/reopened (see btn12_cb: lv_obj_del_async(cont_menu) + all these
+         * pointers set to NULL) - create_button() only ever takes a fixed literal
+         * for its initial label, so this must be formatted from the LIVE value
+         * every time, or the button keeps showing "SPT 0" on reopen regardless of
+         * what spec_smooth_passes actually holds (the value itself is a plain
+         * global and does persist correctly across that rebuild - only the label
+         * was wrong). */
+        char spt_label[8];
+        snprintf(spt_label, sizeof(spt_label), "SPT %d", (int)spec_smooth_passes);
+        btn8_filtro = create_button(grid_btns, spt_label, btn8_cb);
+    }
     btn9_agc = create_button(grid_btns, "AGC", btn9_cb);
-    btn10 = create_button(grid_btns, "BTN 10", btn10_cb);
-    btn11 = create_button(grid_btns, "BTN 11", btn11_cb);
+    btn10 = create_button(grid_btns, "NFM", btn10_cb);
+    btn11 = create_button(grid_btns, "WFM", btn11_cb);
     btn12_close = create_button(grid_btns, LV_SYMBOL_CLOSE, btn12_cb);
 }
 

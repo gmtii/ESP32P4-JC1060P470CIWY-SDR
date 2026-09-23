@@ -7,6 +7,8 @@
 #include "esp_dsp.h"
 #include "esp_err.h"
 #include "esp_mac.h"
+#include "esp_heap_caps.h"
+#include "esp_log.h"
 #include "math.h"
 
 #include "sdr_math.h"
@@ -16,6 +18,25 @@
 #include "sdr_priv.h"
 #include "rtl_source.h"
 #include "rtl_dsp.h"
+
+/* Uncomment to log the spectrum AGC's actual frame dB range once a second - see
+ * sdr_priv.h's SPEC_AGC_DB_FLOOR/CEIL comment for why this is worth running on real
+ * hardware before trusting those constants. */
+// #define SPEC_AGC_LOG
+
+/*
+ * Frame-to-frame (temporal) spectrum smoothing weight for the new frame - the OTHER
+ * kind of smoothing, distinct from SPT's spatial (bin-to-bin, single-frame) pass
+ * below. This is what actually calms a trace that visibly jumps/flickers frame to
+ * frame ("nervous" in that sense) - SPT alone does very little for that, since it
+ * only ever operates within one already-computed frame. Lower = slower/heavier
+ * smoothing (more weight on the past), higher = snappier/more jittery. Was a fixed
+ * 0.6 (fairly fast/light); starting lower here since Jorge reported the default
+ * looking "nervous" and 5 passes of SPT barely changing that - not measured against
+ * real hardware/signal conditions, so treat 0.25 as a first guess to retune, not a
+ * calibrated value. 'f' suffix: the P4 FPU is single precision only, an unsuffixed
+ * constant here would make this soft-float. */
+#define SPEC_TEMPORAL_ALPHA 0.25f
 #include "audio_out.h"
 
 #include "agc.h"
@@ -132,6 +153,15 @@ void IRAM_ATTR sdrTask(void *args)
     dsps_fird_init_f32(&fird_q, fird_coeffs, fird_delay_q, FIR_COEFFS_LEN, DR);
 
     generate_FIR_coefficients(fird_coeffs, FIR_COEFFS_LEN, 0.75 / DR);
+
+    /* See the field comment in sdr_priv.h: PSRAM, not static internal-RAM arrays. */
+    i_sample_wide = heap_caps_malloc(WFM_BUFFER_SIZE * sizeof(float), MALLOC_CAP_SPIRAM);
+    q_sample_wide = heap_caps_malloc(WFM_BUFFER_SIZE * sizeof(float), MALLOC_CAP_SPIRAM);
+    wfm_discrim = heap_caps_malloc(WFM_BUFFER_SIZE * sizeof(float), MALLOC_CAP_SPIRAM);
+    if (!i_sample_wide || !q_sample_wide || !wfm_discrim)
+    {
+        ESP_LOGE("sdr", "WFM buffer allocation failed (PSRAM); WFM mode will not be usable");
+    }
 
     /* WFM (broadcast FM) decimator: 192 -> 48 kSps, cutoff at the mono audio bandwidth
      * (~15 kHz). NOT the same 0.75/DR convention fird_i/fird_q use above - that value is
@@ -412,14 +442,11 @@ void IRAM_ATTR sdrTask(void *args)
                 sampleData_out[i].ch[1] = sampleData_out[i].ch[0]; // segundo canal para el SFM
             }
         }
-        else
-        {
-            for (i = 0; i < SAMPLE_BUFFER_SIZE; i++)
-            {
-                sampleData_out[i].ch[0] = sampleData_in[i].ch[0];
-                sampleData_out[i].ch[1] = sampleData_in[i].ch[1];
-            }
-        }
+        /* wfm: sampleData_out was already built above, in the WFM branch itself - this
+         * block used to be an unconditional `if (1) {...}` with an unreachable `else`
+         * (dead code, from before WFM existed); switching it to `if (!wfm)` gave that
+         * `else` a way to run for real, clobbering WFM's audio with a raw copy of the
+         * input samples. Removed: there is nothing left for WFM to do here. */
 
         time_sdrtask = dsp_get_cpu_cycle_count() - start_sdrtask;
 
@@ -484,45 +511,115 @@ void IRAM_ATTR calcula_fft(void)
         fft_mag[i + 0] = (fft_vector[(i + N / 2) * 2] * fft_vector[(i + N / 2) * 2] + fft_vector[(i + N / 2) * 2 + 1] * fft_vector[(i + N / 2) * 2 + 1]);
     }
 
-    int spec_min = 0;
-    int spec_max = 0;
+    /* Raw per-bin dB (unscaled, uncalibrated - see calcula_fft()'s callers/sdr_priv.h's
+     * comment) and this frame's own min/max, tracked for the AGC below. */
+    float frame_db_min = 1e9f;
+    float frame_db_max = -1e9f;
+    /* PSRAM, not a static internal-RAM array (was, until Jorge hit "Not enough memory
+     * for LVGL buffer" again after several turns of UI additions - this 4 KiB, plus
+     * smooth_tmp's 2 KiB below, was part of what pushed internal RAM back over the
+     * edge, the same failure mode as the WFM buffers' original ESP_ERR_NO_MEM). Lazy
+     * one-time allocation, matching fft_color_map()'s palette_lut_init() pattern. */
+    static float *raw_db = NULL;
+    if (raw_db == NULL)
+    {
+        raw_db = heap_caps_malloc(SAMPLE_BUFFER_SIZE * sizeof(float), MALLOC_CAP_SPIRAM);
+        if (raw_db == NULL)
+        {
+            ESP_LOGE("sdr", "raw_db PSRAM allocation failed; spectrum/waterfall AGC will not run this boot");
+            return;
+        }
+    }
 
     for (int i = 0; i < N; i++)
     {
-        /* 'f' suffix: the P4 FPU is single precision only, a double constant makes this soft-float */
-        fft_mag[i] = 0.6f * fft_mag[i] + 0.4f * fft_mag_old[i];
+        fft_mag[i] = SPEC_TEMPORAL_ALPHA * fft_mag[i] + (1.0f - SPEC_TEMPORAL_ALPHA) * fft_mag_old[i];
         fft_mag_old[i] = fft_mag[i];
-        pixelnew[N - 1 - i] = 20 * log10f_fast(fft_mag[i] * (float)(32768.0f));
-
-        if (spec_min > pixelnew[i]) // Calcula el valor mínimo del vector pixelnew
-            spec_min = pixelnew[i];
-
-        if (spec_max < pixelnew[i]) // valor máximo
-            spec_max = pixelnew[i];
+        raw_db[N - 1 - i] = 20 * log10f_fast(fft_mag[i] * (float)(32768.0f));
     }
-
-    spec_offset = (spec_offset + 9 * spec_offset_old) / 10;
-
-    if (spec_min < -15 && spec_offset < 5) // estamos muy abajo, subimos el espectro a ritmo de *spec_agc
-        spec_offset += 3 * spec_agc;
-    else if (spec_min < 0 && spec_offset < 25 && spec_rebote++ > 3) // no tan abajo, subimos a ritmo spec_agc
+    for (int i = 0; i < N; i++)
     {
-        spec_offset += spec_agc;
-        spec_rebote = 0;
+        if (raw_db[i] < frame_db_min) frame_db_min = raw_db[i];
+        if (raw_db[i] > frame_db_max) frame_db_max = raw_db[i];
     }
-    else if (spec_max > WAVEFORM_HEIGHT / 2 && spec_rebote++ > 3) // muy altos, bajamos a ritmo de spec_agc
+
+#ifdef SPEC_AGC_LOG
+    /* See the // #define SPEC_AGC_LOG near the top of this file. */
     {
-        spec_offset -= spec_agc;
-        spec_rebote = 0;
+        static int log_count = 0;
+        if (++log_count >= 50) /* ~1 s at the UI timer's ~50 Hz */
+        {
+            log_count = 0;
+            ESP_LOGI("sagc", "frame_db [%.1f .. %.1f]  window [%.1f .. %.1f]",
+                     frame_db_min, frame_db_max, spec_db_min, spec_db_max);
+        }
+    }
+#endif
+
+    if (spec_agc_enabled)
+    {
+        /* See sdr_priv.h's comment on spec_db_min/spec_db_max for the full design and
+         * the ported-from-a-sibling-project provenance of these constants. */
+        float target_min = frame_db_min - SPEC_AGC_FLOOR_MARGIN_DB;
+        float target_max = target_min + SPEC_AGC_MIN_SPAN_DB;
+        if (frame_db_max + SPEC_AGC_CEIL_MARGIN_DB > target_max)
+        {
+            target_max = frame_db_max + SPEC_AGC_CEIL_MARGIN_DB;
+        }
+        if (target_min < SPEC_AGC_DB_FLOOR) target_min = SPEC_AGC_DB_FLOOR;
+        if (target_max > SPEC_AGC_DB_CEIL) target_max = SPEC_AGC_DB_CEIL;
+        if (target_max < target_min + SPEC_AGC_MIN_GAP) target_max = target_min + SPEC_AGC_MIN_GAP;
+
+        spec_db_min += (target_min - spec_db_min) * SPEC_AGC_SMOOTH_ALPHA;
+        spec_db_max += (target_max - spec_db_max) * SPEC_AGC_SMOOTH_ALPHA;
     }
 
-    if (spec_offset > WAVEFORM_HEIGHT / 2)
-        spec_offset = WAVEFORM_HEIGHT / 2; // corrección para el caso de offset disparado
+    /* Map [spec_db_min, spec_db_max] -> [0, WAVEFORM_HEIGHT-1], clamped: this is both
+     * the bar height (spectrum()/waterfall_update() use pixelnew directly as a pixel
+     * height) and, via the existing (uint8_t)abs(pixelnew[x]) cast, the palette index -
+     * same dual role pixelnew always had, just properly windowed and clamped now
+     * (previously nothing stopped it exceeding 255 and wrapping in that cast). */
+    const float scale = (float)(WAVEFORM_HEIGHT - 1) / (spec_db_max - spec_db_min);
+    for (int i = 0; i < N; i++)
+    {
+        float v = (raw_db[i] - spec_db_min) * scale;
+        if (v < 0.0f) v = 0.0f;
+        if (v > (float)(WAVEFORM_HEIGHT - 1)) v = (float)(WAVEFORM_HEIGHT - 1);
+        pixelnew[i] = (int16_t)v;
+    }
 
-    spec_offset_old = spec_offset;
-
-    for (int i = 0; i < N; i++) // aplica el "offset" al espectro para ajustar
-        pixelnew[i] += spec_offset;
+    /* "SPT": spatial (bin-to-bin) smoothing - see sdr_priv.h's spec_smooth_passes
+     * comment for the full design/provenance. Purely visual, redone from scratch
+     * every frame on top of pixelnew (post-AGC, post-quantization); it never
+     * touches fft_mag_old, the temporal EMA state above, which is a separate,
+     * complementary smoothing (frame-to-frame, not bin-to-bin). */
+    if (spec_smooth_passes > 0 && N >= 3)
+    {
+        /* PSRAM, not static internal RAM - see raw_db's comment above for why. */
+        static int16_t *smooth_tmp = NULL;
+        if (smooth_tmp == NULL)
+        {
+            smooth_tmp = heap_caps_malloc(SAMPLE_BUFFER_SIZE * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+        }
+        if (smooth_tmp == NULL)
+        {
+            ESP_LOGE("sdr", "smooth_tmp PSRAM allocation failed; skipping SPT this frame");
+        }
+        else
+        for (uint8_t pass = 0; pass < spec_smooth_passes; pass++)
+        {
+            smooth_tmp[0] = pixelnew[0];
+            for (int i = 1; i < N - 1; i++)
+            {
+                smooth_tmp[i] = (int16_t)(((int32_t)pixelnew[i - 1] + 2 * (int32_t)pixelnew[i] + (int32_t)pixelnew[i + 1]) / 4);
+            }
+            smooth_tmp[N - 1] = pixelnew[N - 1];
+            for (int i = 0; i < N; i++)
+            {
+                pixelnew[i] = smooth_tmp[i];
+            }
+        }
+    }
 
     // Rota 128 a la derecha para corregir el problema con el CANVAS dichoso de LGVL
 

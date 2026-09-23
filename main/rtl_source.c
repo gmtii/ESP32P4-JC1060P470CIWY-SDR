@@ -29,6 +29,10 @@
 
 static const char *TAG = "rtl_source";
 
+/* Uncomment to log how long each retune actually blocks (pause bulk + drain + EP0 +
+ * resubmit) - see ui.c's SPECTRUM_DRAG_RETUNE_MIN_US comment for why. */
+// #define RTL_SOURCE_RETUNE_LOG
+
 /*
  * Sized for the worst case (wide/WFM mode, 192 kSps): RING_FRAMES gives the same
  * ~170 ms of headroom wide mode had at 48 kSps (8192 frames there), scaled by the
@@ -314,7 +318,17 @@ static void ctl_task(void *arg)
         }
         if (__atomic_exchange_n(&S.lo_pending, false, __ATOMIC_ACQUIRE)) {
             const uint32_t lo = S.want_lo_hz;
+#ifdef RTL_SOURCE_RETUNE_LOG
+            /* How long does a real retune (pause bulk + drain + EP0 + resubmit, per
+             * esp_rtl_sdr's own source) actually take on this hardware? Needed to pick
+             * ui.c's SPECTRUM_DRAG_RETUNE_MIN_US on measurement instead of a guess -
+             * see that constant's comment. */
+            const int64_t t0 = esp_timer_get_time();
+#endif
             const esp_err_t err = esp_rtl_sdr_retune_hz(S.sdr, lo);
+#ifdef RTL_SOURCE_RETUNE_LOG
+            ESP_LOGI(TAG, "retune to %u Hz took %lld us", (unsigned)lo, (long long)(esp_timer_get_time() - t0));
+#endif
             if (err != ESP_OK) {
                 ESP_LOGW(TAG, "retune %u Hz failed: %s", (unsigned)lo, esp_rtl_sdr_err_to_name(err));
             }
