@@ -25,6 +25,7 @@
 
 #include "rtl_source.h"
 
+#include "palettes.h"
 #include "menu.h"
 
 #include "lvgl.h"
@@ -299,6 +300,29 @@ static void btn11_cb(lv_event_t *e)
     refresca_indicadores();
 }
 
+/*
+ * PALETTE: cycles the waterfall / FT8-cascade color palette through the full
+ * SDR++ set (palettes.c). Applied live and saved in NVS by ui_set_palette().
+ */
+static lv_obj_t *btn13_palette = NULL;
+
+static void palette_btn_label(void)
+{
+    lv_obj_t *lbl = (btn13_palette != NULL) ? lv_obj_get_child(btn13_palette, 0) : NULL;
+    if (lbl != NULL)
+    {
+        lv_label_set_text_fmt(lbl, "PALETTE\n%s", palette_name(ui_get_palette()));
+    }
+}
+
+static void btn13_cb(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED)
+        return;
+    ui_set_palette((ui_get_palette() + 1) % PALETTE_COUNT);
+    palette_btn_label();
+}
+
 /* =========================================================
  * BOTÓN CERRAR (DESTRUYE EL MENÚ)
  * ========================================================= */
@@ -309,8 +333,9 @@ static void btn12_cb(lv_event_t *e)
     if (lv_event_get_code(e) != LV_EVENT_CLICKED)
         return;
 
-    if (cont_menu && lv_obj_is_valid(cont_menu)) {
-        lv_obj_del_async(cont_menu); 
+    if (cont_menu && lv_obj_is_valid(cont_menu))
+    {
+        lv_obj_del_async(cont_menu);
 
         cont_menu = NULL;
 
@@ -318,6 +343,7 @@ static void btn12_cb(lv_event_t *e)
         menu_scr = NULL;
         row_sliders = NULL;
         grid_btns = NULL;
+        btn13_palette = NULL;
 
         box_s1 = sl_s1 = NULL;
         box_s2 = sl_s2 = NULL;
@@ -441,11 +467,16 @@ void ui_create_control_panel(void)
     create_slider_block(row_sliders, "Brightness", 1, 200,
                         var_slider4, slider_brightness, &box_s4, &sl_s4, &lbl_s4);
 
-    /* ---------- Botonera (2 filas x 6 botones) ---------- */
+    /* ---------- Botonera (3 filas: 6 + 6 + PALETTE) ----------
+     * Height and row gap set explicitly so the third row fits:
+     * 3 x 60 px buttons + 2 x 10 px gaps = 200 px, inside the 500 px panel
+     * (16 px padding x 2 + 190 px sliders + column gap + this grid). */
     grid_btns = lv_obj_create(cont_menu);
     lv_obj_set_width(grid_btns, lv_pct(100));
-    lv_obj_set_height(grid_btns, 200);
+    lv_obj_set_height(grid_btns, 210);
     lv_obj_set_style_pad_all(grid_btns, 0, 0);
+    lv_obj_set_style_pad_row(grid_btns, 10, 0);
+    lv_obj_remove_flag(grid_btns, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_style_border_width(grid_btns, 0, 0);
 
     /* Flex: filas con wrap */
@@ -481,6 +512,11 @@ void ui_create_control_panel(void)
     btn10 = create_button(grid_btns, "NFM", btn10_cb);
     btn11 = create_button(grid_btns, "WFM", btn11_cb);
     btn12_close = create_button(grid_btns, LV_SYMBOL_CLOSE, btn12_cb);
+
+    btn13_palette = create_button(grid_btns, "PALETTE", btn13_cb);
+    lv_obj_set_width(btn13_palette, 180); /* room for "Temper Colors" */
+    lv_obj_set_style_text_align(lv_obj_get_child(btn13_palette, 0), LV_TEXT_ALIGN_CENTER, 0);
+    palette_btn_label();
 }
 
 /* ------------------------------------------------------------------------------- */
@@ -542,15 +578,18 @@ static void freq_btnm_event_cb(lv_event_t *e)
             currentVFO.Frec = hz;
             refresca_VFO();
             rtl_source_set_freq(currentVFO.Frec - lo_offset_for_mode(demod_modo));
+            freq_popup_close();
+
+            inicia_timers();
         }
         return;
     }
 
     if (strcmp(txt, LV_SYMBOL_OK) == 0)
     {
-        uint32_t hz = parse_freq(lv_textarea_get_text(ta_freq), 1e6);
-        if (hz)
-            currentVFO.Frec = hz;
+        // uint32_t hz = parse_freq(lv_textarea_get_text(ta_freq), 1e6);
+        // if (hz)
+        //     currentVFO.Frec = hz;
         refresca_VFO();
         rtl_source_set_freq(currentVFO.Frec - lo_offset_for_mode(demod_modo));
         freq_popup_close();

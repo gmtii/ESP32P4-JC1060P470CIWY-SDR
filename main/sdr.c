@@ -18,6 +18,7 @@
 #include "sdr_priv.h"
 #include "rtl_source.h"
 #include "rtl_dsp.h"
+#include "ft8_app.h"
 
 /* Uncomment to log the spectrum AGC's actual frame dB range once a second - see
  * sdr_priv.h's SPEC_AGC_DB_FLOOR/CEIL comment for why this is worth running on real
@@ -315,6 +316,15 @@ void IRAM_ATTR sdrTask(void *args)
                 else if (demod_modo == DEMOD_USB)
                 {
                     dsps_sub_f32(i_sample_out_d, q_sample_out_d, demod_out_d, SAMPLE_BUFFER_SIZE / DR, 1, 1, 1); // Demodula LSB
+
+                    /* FT8 tap: raw 12 kHz USB audio, BEFORE the passband
+                     * biquads, NR and RxAGC below - the same point the
+                     * DeepSDR 101 taps (s_ssb_dec). FT8 has its own AGC and
+                     * needs the full 0-1600 Hz window regardless of the
+                     * filter chosen for listening. Only copies into a
+                     * stream buffer (no-op unless FT8 mode is on); all the
+                     * FT8 DSP runs in its own task - see ft8/ft8_app.c. */
+                    ft8_app_feed_audio(demod_out_d, SAMPLE_BUFFER_SIZE / DR);
                 }
             }
             else if (demod_modo >= DEMOD_SAM && demod_modo <= DEMOD_SAMU)

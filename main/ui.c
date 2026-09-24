@@ -30,6 +30,13 @@
 
 #include "menu.h"
 
+#include "ft8_app.h"
+#include "ft8_ui.h"
+#include "ft8_time.h"
+#include "palettes.h"
+#include "nvs_flash.h"
+#include "nvs.h"
+
 extern VFO currentVFO;
 
 static char *TAG = "UI";
@@ -144,7 +151,8 @@ static void desbloquear_cb(lv_timer_t *timer)
  * spectrum included, since its own redraw timer can then never run again. */
 static void update_vfo_label(void)
 {
-  lv_label_set_text_fmt(freq_label, "%d%d.%d%d%d.%d%d%d",
+  lv_label_set_text_fmt(freq_label, "%d%d%d.%d%d%d.%d%d%d",
+                        (currentVFO.Frec % 1000000000) / 100000000,
                         (currentVFO.Frec % 100000000) / 10000000,
                         (currentVFO.Frec % 10000000) / 1000000,
                         (currentVFO.Frec % 1000000) / 100000,
@@ -166,8 +174,28 @@ void refresca_VFO(void)
   }
 }
 
+/* Full wipe of the spectrum and waterfall canvases. Needed after the FT8
+ * panel has covered them: spectrum() draws incrementally (erases the previous
+ * trace from pixelold[], then draws pixelnew[]), and calcula_fft() in sdr.c
+ * keeps updating pixelold[] every frame even while nothing is drawn - so on
+ * return the erase pass would hit a trace that is not the one on the canvas,
+ * leaving stale fragments. The waterfall would also still show rows from
+ * before FT8 was entered. After this wipe the first erase pass only paints
+ * black over black, and spectrum() redraws the grid lines itself. */
+static void spectrum_waterfall_full_clear(void)
+{
+  memset(waveformbuffer, 0x00, WAVEFORM_WIDTH * WAVEFORM_HEIGHT * sizeof(uint16_t));
+  memset(waterfallbuffer, 0x00, 2u * WAVEFORM_WIDTH * WATERFALL_HEIGHT * sizeof(uint16_t));
+  waterfall_head = 0;
+  lv_canvas_set_buffer(waterfall_canvas, waterfallbuffer, WAVEFORM_WIDTH, WATERFALL_HEIGHT, LV_COLOR_FORMAT_RGB565);
+  lv_obj_invalidate(waveform_canvas);
+  lv_obj_invalidate(waterfall_canvas);
+}
+
 void timer_dibuja_pantalla(lv_timer_t *timer)
 {
+  static bool covered_by_ft8 = false;
+
   if (screen_update)
   {
 #ifdef UI_PERF_LOG
@@ -184,6 +212,22 @@ void timer_dibuja_pantalla(lv_timer_t *timer)
     /* Task lock */
     if (lvgl_port_lock(0))
     {
+      /* While the FT8 panel covers the spectrum/waterfall, calcula_fft()
+       * above keeps running (the S-meter depends on it) but the hidden
+       * redraws are skipped. */
+      if (ft8_ui_is_visible())
+      {
+        covered_by_ft8 = true;
+        lvgl_port_unlock();
+        return;
+      }
+      if (covered_by_ft8)
+      {
+        /* First frame after leaving FT8 (any path: FT8 button, mode change
+         * from the menu or the MODE button): start from clean canvases. */
+        covered_by_ft8 = false;
+        spectrum_waterfall_full_clear();
+      }
       spectrum();
 #ifdef UI_PERF_LOG
       const int64_t t2 = esp_timer_get_time();
@@ -207,14 +251,25 @@ void timer_dibuja_pantalla(lv_timer_t *timer)
   }
 }
 
-/* Placeholder clock: uptime since boot. See label_clock's comment at creation
- * for what replaces this once the real RTC/NTP source is wired up. */
+/* Clock: UTC from the system clock once it has been synced (serial time-sync
+ * tool or the FT8 panel's SYNC button - see ft8_time.h); uptime since boot
+ * until then. An NTP (ESP32-C6) or RTC source only needs to set the system
+ * clock through ft8_time_set_epoch_ms() for this to show it. */
 void timer_clock_update(lv_timer_t *timer)
 {
   (void)timer;
-  int64_t s = esp_timer_get_time() / 1000000;
-  lv_label_set_text_fmt(label_clock, "%02d:%02d:%02d",
-                        (int)((s / 3600) % 100), (int)((s / 60) % 60), (int)(s % 60));
+  if (ft8_time_is_synced())
+  {
+    struct tm t;
+    ft8_time_get_utc(&t);
+    lv_label_set_text_fmt(label_clock, "%02d:%02d:%02d UTC", t.tm_hour, t.tm_min, t.tm_sec);
+  }
+  else
+  {
+    int64_t s = esp_timer_get_time() / 1000000;
+    lv_label_set_text_fmt(label_clock, "%02d:%02d:%02d",
+                          (int)((s / 3600) % 100), (int)((s / 60) % 60), (int)(s % 60));
+  }
 }
 
 void timer_smeter_update(lv_timer_t *timer)
@@ -382,6 +437,100 @@ static void slider_changed_cb(lv_event_t *e)
   lv_label_set_text_fmt(value_label, "%d", v);
 }
 
+/* ---------------------------------------------------------------------------
+ * FT8 mode (bottom-row FT8 button). DSP side: ft8_app.c; panel: ft8_ui.c.
+ * ------------------------------------------------------------------------- */
+static lv_obj_t *btn_ft8;
+static lv_obj_t *label_ft8;
+
+/* Standard FT8 dial frequencies (USB) and the band each one belongs to. On
+ * entering FT8 the VFO snaps to the FT8 frequency of the band it is in; if it
+ * is outside every amateur band listed here, it goes to 20 m. */
+typedef struct
+{
+  uint32_t lo, hi, dial;
+} ft8_band_t;
+
+static const ft8_band_t k_ft8_bands[] = {
+    {1800000, 2000000, 1840000},     /* 160 m */
+    {3500000, 4000000, 3573000},     /* 80 m */
+    {5250000, 5450000, 5357000},     /* 60 m */
+    {7000000, 7300000, 7074000},     /* 40 m */
+    {10100000, 10150000, 10136000},  /* 30 m */
+    {14000000, 14350000, 14074000},  /* 20 m */
+    {18068000, 18168000, 18100000},  /* 17 m */
+    {21000000, 21450000, 21074000},  /* 15 m */
+    {24890000, 24990000, 24915000},  /* 12 m */
+    {28000000, 29700000, 28074000},  /* 10 m */
+    {50000000, 54000000, 50313000},  /* 6 m */
+    {144000000, 148000000, 144174000}, /* 2 m */
+};
+
+static uint32_t ft8_dial_for(uint32_t f)
+{
+  for (size_t i = 0; i < sizeof(k_ft8_bands) / sizeof(k_ft8_bands[0]); i++)
+  {
+    if (f >= k_ft8_bands[i].lo && f <= k_ft8_bands[i].hi)
+    {
+      return k_ft8_bands[i].dial;
+    }
+  }
+  return 14074000;
+}
+
+static void ft8_button_refresh(void)
+{
+  if (label_ft8 != NULL)
+  {
+    lv_label_set_text(label_ft8, ft8_app_is_active() ? "ON" : "OFF");
+  }
+}
+
+/* ft8_ui.c calls this when it leaves FT8 on its own (mode changed elsewhere). */
+static void ft8_exit_cb(void)
+{
+  ft8_button_refresh();
+}
+
+static void ft8_mode_toggle(void)
+{
+  if (!ft8_app_available())
+  {
+    ESP_LOGW(TAG, "FT8 not available (init failed, see log)");
+    return;
+  }
+
+  if (ft8_app_is_active())
+  {
+    ft8_app_set_active(false);
+    ft8_ui_show(false);
+  }
+  else
+  {
+    const bool was_wfm = (demod_modo == DEMOD_WFM);
+
+    demod_modo = DEMOD_USB;
+    currentVFO.demod_modo = DEMOD_USB;
+    currentVFO.Frec = ft8_dial_for(currentVFO.Frec);
+    update_vfo_label(); /* already inside the LVGL context here */
+    if (was_wfm)
+    {
+      /* WFM had switched the tuner to AGC - restore the manual gain */
+      rtl_source_set_gain_auto(false);
+      rtl_source_set_gain_db(menu_get_rtl_gain_db());
+    }
+    rtl_source_set_freq(currentVFO.Frec - lo_offset_for_mode(demod_modo));
+
+    lv_label_set_text_fmt(label_modos, "%s", demod_modos_texto[demod_modo]);
+    dibuja_pasabanda();
+    refresca_indicadores();
+
+    ft8_app_set_active(true);
+    ft8_ui_show(true);
+  }
+  ft8_button_refresh();
+}
+
 void btn_event_cb(lv_event_t *e)
 {
   if (bloqueo_pulsacion)
@@ -476,6 +625,10 @@ void btn_event_cb(lv_event_t *e)
 
       dibuja_pasabanda();
       refresca_indicadores();
+    }
+    else if (obj == btn_ft8)
+    {
+      ft8_mode_toggle();
     }
     else if (obj == btn5)
     {
@@ -600,6 +753,14 @@ void dibuja_botones(void)
 
   add_name_value_labels(btn_step, "STEP", &label_step);
   lv_label_set_text_fmt(label_step, "%d", pasos[pasos_indice]);
+
+  /* --- Botón FT8: "FT8" / ON|OFF --- */
+  btn_ft8 = lv_btn_create(screen);
+  style_ctrl_button(btn_ft8);
+  lv_obj_align(btn_ft8, LV_ALIGN_BOTTOM_LEFT, 10 + 4 * (UI_CTRL_BTN_W + UI_CTRL_BTN_GAP), -10);
+
+  add_name_value_labels(btn_ft8, "FT8", &label_ft8);
+  lv_label_set_text(label_ft8, "OFF");
 
   return;
 
@@ -823,57 +984,73 @@ void tarea_encoder(void *arg)
 }
 
 /*
- * "Classic" palette, exact stops from SDR++'s own root/res/colormaps/classic.json
- * (author: Youssef Touil) - dark navy -> blues -> white -> yellow -> orange -> red
- * -> dark red. Replaces the previous 4-segment synthetic gradient (a hand-picked
- * blue/cyan/green/yellow/red ramp, not from SDR++) with the real thing, per Jorge.
+ * Waterfall / FT8-cascade palette. The full SDR++ set (plus the DeepSDR's
+ * "Fire") lives in palettes.c; the default, Classic, is bit-identical to the
+ * single palette this file used to hard-code.
  *
- * Built into a 256-entry LUT once at startup (palette_lut_init(), called from
- * init_ui()) rather than interpolated per call: fft_color_map() is called once per
- * lit pixel in both spectrum() and waterfall_update(), the hottest path in the UI
- * (a sibling GD32F450 SDR project's own spectrum.h documents the same lesson: a
- * float colormap function with divisions/branches, called per-pixel, dominates
- * frame time over the actual pixel writes). A LUT lookup replaces the previous
- * 4-branch/2-multiply version with a single array read - strictly cheaper too.
+ * Built into a 256-entry LUT (palette_lut_init()) rather than evaluated per
+ * call: fft_color_map() runs once per pixel in waterfall_update(), the
+ * hottest path in the UI. The selection is stored in NVS (namespace "ui",
+ * key "palette") and restored at boot. The LUT is only rebuilt from the LVGL
+ * context (init_ui(), menu button), which is also the only context that
+ * reads it, so no locking is needed.
  */
-static const uint8_t k_palette_classic_stops[15][3] = {
-    {0, 0, 32}, {0, 0, 48}, {0, 0, 80}, {0, 0, 145}, {30, 144, 255},
-    {255, 255, 255}, {255, 255, 0}, {254, 109, 22}, {254, 109, 22},
-    {255, 0, 0}, {255, 0, 0}, {198, 0, 0}, {159, 0, 0}, {117, 0, 0}, {74, 0, 0},
-};
-
-static uint16_t palette_lerp_stops(const uint8_t stops[][3], uint8_t n_stops, float t)
-{
-  float pos, u;
-  uint8_t i0, i1, r, g, b;
-
-  if (t < 0.0f) t = 0.0f;
-  if (t > 1.0f) t = 1.0f;
-
-  pos = t * (float)(n_stops - 1U);
-  i0 = (uint8_t)pos;
-  if (i0 > (uint8_t)(n_stops - 2U)) i0 = (uint8_t)(n_stops - 2U); /* guards the t=1.0 exact-edge case */
-  i1 = (uint8_t)(i0 + 1U);
-  u = pos - (float)i0;
-
-  r = (uint8_t)((float)stops[i0][0] + u * ((float)stops[i1][0] - (float)stops[i0][0]));
-  g = (uint8_t)((float)stops[i0][1] + u * ((float)stops[i1][1] - (float)stops[i0][1]));
-  b = (uint8_t)((float)stops[i0][2] + u * ((float)stops[i1][2] - (float)stops[i0][2]));
-
-  return (uint16_t)(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
-}
-
 static uint16_t s_palette_lut[256];
 static bool s_palette_lut_ready = false;
+static int s_palette_id = PALETTE_CLASSIC;
 
 static void palette_lut_init(void)
 {
-  int i;
-  for (i = 0; i < 256; i++)
-  {
-    s_palette_lut[i] = palette_lerp_stops(k_palette_classic_stops, 15U, (float)i * (1.0f / 255.0f));
-  }
+  palette_build_lut(s_palette_id, s_palette_lut);
   s_palette_lut_ready = true;
+}
+
+static void palette_load_from_nvs(void)
+{
+  nvs_handle_t h;
+  uint8_t v;
+
+  (void)nvs_flash_init(); /* ESP_OK if already initialized (ft8_app_init() does it too) */
+  if (nvs_open("ui", NVS_READONLY, &h) != ESP_OK)
+  {
+    return;
+  }
+  if (nvs_get_u8(h, "palette", &v) == ESP_OK && v < PALETTE_COUNT)
+  {
+    s_palette_id = v;
+  }
+  nvs_close(h);
+}
+
+static void palette_save_to_nvs(void)
+{
+  nvs_handle_t h;
+
+  if (nvs_open("ui", NVS_READWRITE, &h) != ESP_OK)
+  {
+    return;
+  }
+  if (nvs_set_u8(h, "palette", (uint8_t)s_palette_id) == ESP_OK)
+  {
+    nvs_commit(h);
+  }
+  nvs_close(h);
+}
+
+int ui_get_palette(void)
+{
+  return s_palette_id;
+}
+
+void ui_set_palette(int id)
+{
+  if (id < 0 || id >= PALETTE_COUNT)
+  {
+    id = PALETTE_CLASSIC;
+  }
+  s_palette_id = id;
+  palette_lut_init(); /* the next waterfall row already uses it */
+  palette_save_to_nvs();
 }
 
 uint16_t fft_color_map(uint8_t v)
@@ -913,6 +1090,7 @@ void waterfall_update(void)
 
 void init_ui()
 {
+  palette_load_from_nvs();
   palette_lut_init();
 
   /* Obtén la pantalla activa */
@@ -1057,6 +1235,10 @@ void init_ui()
   dibuja_pasabanda();
   indicadores_create(screen);
   refresca_indicadores();
+
+  /* FT8 panel last, so it sits above the canvases and the passband box. */
+  ft8_ui_create(screen, UI_SPECTRUM_TOP_Y);
+  ft8_ui_set_exit_callback(ft8_exit_cb);
 }
 
 void smeter_set_dbm(float dbm)

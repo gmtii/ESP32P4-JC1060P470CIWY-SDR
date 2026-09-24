@@ -26,6 +26,7 @@
 #include "agc.h"
 #include "rtl_source.h"
 #include "uart_commands.h"
+#include "ft8_app.h"
 
 #include "pins_config.h"
 
@@ -244,6 +245,11 @@ void app_main(void)
     /* AGC */
     AGC_init();
     AGC_prep();
+
+    /* FT8 receive mode (buffers in PSRAM + its own task). Must run before
+     * sdrTask starts and before init_ui() builds the FT8 panel. If it fails
+     * the radio works as before, only the FT8 button does nothing. */
+    ft8_app_init();
 
     bsp_i2c_init();
 

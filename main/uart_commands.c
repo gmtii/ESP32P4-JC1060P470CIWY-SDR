@@ -4,6 +4,11 @@
 
 #include "uart_commands.h"
 #include "msi001.h"
+#include "esp_timer.h"
+#include <time.h>
+
+#include "time_sync.h"
+#include "ft8_time.h"
 
 #define UART_NUM UART_NUM_0
 #define BUF_SIZE 1024
@@ -33,6 +38,15 @@ void uart_command_handler(char *cmd) {
     else if (strcmp(cmd, "-") == 0) {
         ESP_LOGI(TAG, "Comando recibido: apagar LED");
     }
+    else if (strcmp(cmd, "utc") == 0) {
+        /* Quick check of the clock FT8 schedules from (see ft8/ft8_time.h) */
+        struct tm t;
+        ft8_time_get_utc(&t);
+        ESP_LOGI(TAG, "UTC %04d-%02d-%02d %02d:%02d:%02d (%s), sync frames ok=%lu err=%lu",
+                 t.tm_year + 1900, t.tm_mon + 1, t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec,
+                 ft8_time_source_name(ft8_time_get_source()),
+                 (unsigned long)time_sync_get_ok_count(), (unsigned long)time_sync_get_error_count());
+    }
     else {
         ESP_LOGW(TAG, "Comando desconocido: %s", cmd);
     }
@@ -47,6 +61,14 @@ void uart_command_loop(void *arg) {
         int len = uart_read_bytes(UART_NUM, data, 1, pdMS_TO_TICKS(20));
 
         if (len > 0) {
+            /* Binary time/grid frames from the PC time-sync tool (start byte
+             * 0xA5, see ft8/time_sync.h) share this port with the text
+             * commands; bytes that belong to a frame never reach the text
+             * parser below. */
+            if (time_sync_feed_byte(data[0], (uint32_t)(esp_timer_get_time() / 1000))) {
+                continue;
+            }
+
             char c = data[0];
 
             if (c == '\n' || c == '\r') {
