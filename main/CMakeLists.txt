@@ -13,6 +13,7 @@ idf_component_register(
     dsp_example.c
     nr_ss.c
     smeter.c
+    smeter_draw.c
     rtl_dsp.c
     rtl_source.c
     uart_commands.c

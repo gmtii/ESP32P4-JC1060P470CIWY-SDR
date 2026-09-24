@@ -142,21 +142,24 @@ extern "C"
 #define SMETER_ANGLE_MAX 140 // grados
 
 /*
- * Classic horizontal segment S-meter, replacing the analog needle-over-image
- * widget (per Jorge): S1-S9 (green) then S9+10/20/30/40/60 (red), the standard
- * ham-radio convention. Far cheaper than the needle: no ~82 KiB background image
- * (that asset lived in flash/PSRAM-XIP, not RAM, but each needle move still
- * invalidated and re-blitted a 335x145 px region under it); a segment update only
- * touches small rectangles, and (like the needle before it) is skipped entirely
- * when the lit count hasn't changed since the last call.
+ * S-meter panel (top-left). The bar itself (scale ticks, 54 LED-style segments,
+ * peak marker) is rendered by smeter_draw.c into a small RGB565 canvas; the
+ * scale numbers and readouts are LVGL labels. Geometry below matches the host
+ * preview rendered from the same smeter_draw.c code.
  */
-#define SMETER_N_SEGMENTS 14
-#define SMETER_N_S9 9 /* segments 0..N_S9-1 are S1..S9 (green); the rest are S9+10/20/30/40/60 (red) */
-#define SMETER_SEG_W 20
-#define SMETER_SEG_H 30
-#define SMETER_SEG_GAP 3
+#define SMETER_PANEL_X 5
+#define SMETER_PANEL_Y 4
+#define SMETER_PANEL_W 345
+#define SMETER_PANEL_H 128
+#define SMETER_CANVAS_X 10 /* inside the panel */
+#define SMETER_CANVAS_Y 30
+#define SMETER_LABEL_Y 8
 
-    lv_obj_t *smeter_segments[SMETER_N_SEGMENTS];
+    lv_obj_t *smeter_canvas;
+    uint16_t *smeter_canvas_buf;
+    lv_obj_t *smeter_lbl_s;
+    lv_obj_t *smeter_lbl_dbm;
+    lv_obj_t *smeter_lbl_peak;
 
 #ifdef __cplusplus
 }

@@ -16,6 +16,8 @@
 #include "agc.h"
 #include "audio_out.h"
 #include "smeter.h"
+#include "smeter_draw.h"
+#include "esp_heap_caps.h"
 #include "math.h"
 
 #include "rtl_source.h"
@@ -1059,76 +1061,153 @@ void init_ui()
 
 void smeter_set_dbm(float dbm)
 {
-  if (dbm < SMETER_DBM_MIN)
-    dbm = SMETER_DBM_MIN;
+  /* Meter ballistics, like a real rig: fast attack, slow release, and a peak
+   * marker that holds ~1.5 s before falling. Called at the UI frame rate. */
+  static float level = SMETER_DBM_S0 - 3.0f;
+  static float peak = SMETER_DBM_S0 - 3.0f;
+  static int64_t peak_t_us = 0;
+  static int last_lit_x = -1, last_peak_x = -1;
+  static char last_s[12] = "", last_dbm[16] = "", last_pk[20] = "";
 
-  if (dbm > SMETER_DBM_MAX)
-    dbm = SMETER_DBM_MAX;
-
-  float ratio = (dbm - SMETER_DBM_MIN) / (SMETER_DBM_MAX - SMETER_DBM_MIN);
-  int lit = (int)(ratio * SMETER_N_SEGMENTS + 0.5f);
-  if (lit < 0)
-    lit = 0;
-  if (lit > SMETER_N_SEGMENTS)
-    lit = SMETER_N_SEGMENTS;
-
-  /* Same guard the needle had: skip entirely (no style writes, no invalidation)
-   * while the lit count doesn't change. */
-  static int last_lit = -1;
-  if (lit == last_lit)
+  if (smeter_canvas_buf == NULL)
     return;
-  last_lit = lit;
 
-  for (int i = 0; i < SMETER_N_SEGMENTS; i++)
+  if (dbm > level)
+    level += (dbm - level) * 0.6f;
+  else
+    level += (dbm - level) * 0.15f;
+
+  const int64_t now = esp_timer_get_time();
+  if (level >= peak)
   {
-    lv_color_t c;
-    if (i >= lit)
-      c = lv_color_hex(0x202020); /* unlit */
-    else if (i < SMETER_N_S9)
-      c = lv_color_hex(0x00C000); /* S1..S9 */
-    else
-      c = lv_color_hex(0xE02020); /* S9+10/20/30/40/60 */
-    lv_obj_set_style_bg_color(smeter_segments[i], c, 0);
+    peak = level;
+    peak_t_us = now;
+  }
+  else if (now - peak_t_us > 1500000)
+  {
+    peak -= 0.8f; /* ~24 dB/s at 30 fps */
+    if (peak < level)
+      peak = level;
+  }
+
+  /* Bar: redraw only when a segment boundary or the peak marker moved */
+  const int lit_x = smeter_dbm_to_x(level);
+  const int peak_x = smeter_dbm_to_x(peak);
+  if (lit_x != last_lit_x || peak_x != last_peak_x)
+  {
+    smeter_render(smeter_canvas_buf, level, peak);
+    lv_obj_invalidate(smeter_canvas);
+    last_lit_x = lit_x;
+    last_peak_x = peak_x;
+  }
+
+  /* Readouts: update a label only when its text actually changes */
+  char txt[20];
+  smeter_format_s(level, txt, sizeof(txt));
+  if (strcmp(txt, last_s) != 0)
+  {
+    strcpy(last_s, txt);
+    lv_label_set_text(smeter_lbl_s, txt);
+    lv_obj_set_style_text_color(smeter_lbl_s, lv_color_hex(smeter_zone_rgb(level)), 0);
+  }
+  snprintf(txt, sizeof(txt), "%d dBm", (int)(level + (level < 0 ? -0.5f : 0.5f)));
+  if (strcmp(txt, last_dbm) != 0)
+  {
+    strcpy(last_dbm, txt);
+    lv_label_set_text(smeter_lbl_dbm, txt);
+  }
+  if (peak > SMETER_DBM_S0)
+  {
+    char ps[12];
+    smeter_format_s(peak, ps, sizeof(ps));
+    snprintf(txt, sizeof(txt), "PEAK %s", ps);
+  }
+  else
+  {
+    snprintf(txt, sizeof(txt), "PEAK --");
+  }
+  if (strcmp(txt, last_pk) != 0)
+  {
+    strcpy(last_pk, txt);
+    lv_label_set_text(smeter_lbl_peak, txt);
   }
 }
 
 void inicia_smeter_ui(void)
 {
-  /* Classic horizontal segment S-meter (was an analog needle over a ~82 KiB
-   * background image - see smeter_set_dbm()'s comment / ui_priv.h's segment
-   * defines for the full reasoning). Container sized to exactly fit the
-   * segment row; no image, no line object. */
+  /* Panel: dark vertical gradient, thin border, rounded. remove_style_all()
+   * BEFORE set_size (LVGL v9 keeps w/h in the style - see git history). */
   meter_cont = lv_obj_create(screen);
-  /* remove_style_all() FIRST: in LVGL v9 width/height are style properties, so
-   * calling it AFTER lv_obj_set_size() wipes the size right back out. That was
-   * the actual bug behind the broken-looking meter on real hardware - the
-   * container silently reverted to LVGL's default object size, well short of
-   * the 322x30 px this was meant to be, clipping most of the segments and
-   * leaving what looked like an empty leftover frame (same border style as the
-   * old analog meter's, by coincidence, since I reused those exact values). */
   lv_obj_remove_style_all(meter_cont);
-  lv_obj_set_size(meter_cont,
-                  SMETER_N_SEGMENTS * (SMETER_SEG_W + SMETER_SEG_GAP) - SMETER_SEG_GAP,
-                  SMETER_SEG_H);
-  lv_obj_set_style_bg_color(meter_cont, lv_color_hex(0x101010), 0);
+  lv_obj_set_size(meter_cont, SMETER_PANEL_W, SMETER_PANEL_H);
+  lv_obj_set_pos(meter_cont, SMETER_PANEL_X, SMETER_PANEL_Y);
   lv_obj_set_style_bg_opa(meter_cont, LV_OPA_COVER, 0);
-  lv_obj_set_style_border_width(meter_cont, 2, 0);
-  lv_obj_set_style_border_color(meter_cont, lv_color_hex(0x999999), 0);
-  lv_obj_set_style_radius(meter_cont, 6, 0);
-  lv_obj_set_style_pad_all(meter_cont, 4, 0);
-  lv_obj_set_scroll_dir(meter_cont, LV_DIR_NONE);
-  lv_obj_set_scrollbar_mode(meter_cont, LV_SCROLLBAR_MODE_OFF);
+  lv_obj_set_style_bg_color(meter_cont, lv_color_hex(0x161b24), 0);
+  lv_obj_set_style_bg_grad_color(meter_cont, lv_color_hex(0x0a0d12), 0);
+  lv_obj_set_style_bg_grad_dir(meter_cont, LV_GRAD_DIR_VER, 0);
+  lv_obj_set_style_border_width(meter_cont, 1, 0);
+  lv_obj_set_style_border_color(meter_cont, lv_color_hex(0x3a4a5a), 0);
+  lv_obj_set_style_radius(meter_cont, 8, 0);
+  lv_obj_remove_flag(meter_cont, LV_OBJ_FLAG_SCROLLABLE);
 
-  for (int i = 0; i < SMETER_N_SEGMENTS; i++)
+  /* Bar canvas, rendered by smeter_draw.c (PSRAM buffer, ~19 KiB) */
+  smeter_canvas_buf = heap_caps_malloc(SMETER_CANVAS_W * SMETER_CANVAS_H * sizeof(uint16_t), MALLOC_CAP_SPIRAM);
+  smeter_canvas = lv_canvas_create(meter_cont);
+  lv_obj_remove_style_all(smeter_canvas);
+  if (smeter_canvas_buf != NULL)
   {
-    smeter_segments[i] = lv_obj_create(meter_cont);
-    lv_obj_remove_style_all(smeter_segments[i]);
-    lv_obj_set_size(smeter_segments[i], SMETER_SEG_W, SMETER_SEG_H - 8);
-    lv_obj_set_pos(smeter_segments[i], i * (SMETER_SEG_W + SMETER_SEG_GAP), 0);
-    lv_obj_set_style_bg_opa(smeter_segments[i], LV_OPA_COVER, 0);
-    lv_obj_set_style_bg_color(smeter_segments[i], lv_color_hex(0x202020), 0); /* unlit at startup */
-    lv_obj_set_style_radius(smeter_segments[i], 2, 0);
+    smeter_render(smeter_canvas_buf, SMETER_DBM_S0 - 3.0f, SMETER_DBM_S0 - 3.0f);
+    lv_canvas_set_buffer(smeter_canvas, smeter_canvas_buf, SMETER_CANVAS_W, SMETER_CANVAS_H, LV_COLOR_FORMAT_RGB565);
   }
+  else
+  {
+    ESP_LOGE(TAG, "S-meter canvas PSRAM allocation failed");
+  }
+  lv_obj_set_pos(smeter_canvas, SMETER_CANVAS_X, SMETER_CANVAS_Y);
+
+  /* Scale numbers, each centred on its tick (last one right-aligned to the bar end) */
+  lv_obj_t *l = lv_label_create(meter_cont);
+  lv_label_set_text(l, "S");
+  lv_obj_set_style_text_font(l, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_color(l, lv_color_hex(0xc8d2dc), 0);
+  lv_obj_set_pos(l, SMETER_CANVAS_X - 2, SMETER_LABEL_Y);
+  for (int i = 0; i < smeter_label_count; i++)
+  {
+    const int box_w = 40;
+    int x = SMETER_CANVAS_X + smeter_dbm_to_x(smeter_labels[i].dbm) - box_w / 2;
+    lv_text_align_t al = LV_TEXT_ALIGN_CENTER;
+    if (x + box_w > SMETER_CANVAS_X + SMETER_CANVAS_W)
+    {
+      x = SMETER_CANVAS_X + SMETER_CANVAS_W - box_w;
+      al = LV_TEXT_ALIGN_RIGHT;
+    }
+    l = lv_label_create(meter_cont);
+    lv_label_set_text(l, smeter_labels[i].text);
+    lv_obj_set_width(l, box_w);
+    lv_obj_set_style_text_align(l, al, 0);
+    lv_obj_set_style_text_font(l, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(l, lv_color_hex(smeter_labels[i].red ? 0xf05040 : 0xc8d2dc), 0);
+    lv_obj_set_pos(l, x, SMETER_LABEL_Y);
+  }
+
+  /* Readouts */
+  smeter_lbl_s = lv_label_create(meter_cont);
+  lv_obj_set_style_text_font(smeter_lbl_s, &lv_font_montserrat_26, 0);
+  lv_obj_set_style_text_color(smeter_lbl_s, lv_color_hex(smeter_zone_rgb(SMETER_DBM_S0)), 0);
+  lv_label_set_text(smeter_lbl_s, "S0");
+  lv_obj_set_pos(smeter_lbl_s, 12, 74);
+
+  smeter_lbl_dbm = lv_label_create(meter_cont);
+  lv_obj_set_style_text_font(smeter_lbl_dbm, &lv_font_montserrat_18, 0);
+  lv_obj_set_style_text_color(smeter_lbl_dbm, lv_color_hex(0xc8d2dc), 0);
+  lv_label_set_text(smeter_lbl_dbm, "--- dBm");
+  lv_obj_align(smeter_lbl_dbm, LV_ALIGN_TOP_RIGHT, -12, 80);
+
+  smeter_lbl_peak = lv_label_create(meter_cont);
+  lv_obj_set_style_text_font(smeter_lbl_peak, &lv_font_montserrat_12, 0);
+  lv_obj_set_style_text_color(smeter_lbl_peak, lv_color_hex(0x8090a0), 0);
+  lv_label_set_text(smeter_lbl_peak, "PEAK --");
+  lv_obj_align(smeter_lbl_peak, LV_ALIGN_TOP_RIGHT, -12, 106);
 }
 
 void dibuja_pasabanda(void)
