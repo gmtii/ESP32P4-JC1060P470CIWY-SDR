@@ -282,7 +282,8 @@ static void status_update(void)
 /* ---- TIME popup: set the clock "by eye" -------------------------------------
  * Type HHMMSS (or HHMM) in UTC and press OK when a reference clock reaches it;
  * a second or two off is fine - the band-sync loop removes the rest.
- * "Sync :00" snaps to the nearest minute (press at second :00 of a reference). */
+ * "Sync slot" snaps to the nearest 15 s boundary: press it when a reference
+ * clock shows :00, :15, :30 or :45 (the band-sync loop needs nothing more). */
 static lv_obj_t *s_time_popup;
 static lv_obj_t *s_time_ta;
 
@@ -290,7 +291,7 @@ static const char *k_time_map[] = {"1", "2", "3", "\n",
                                    "4", "5", "6", "\n",
                                    "7", "8", "9", "\n",
                                    LV_SYMBOL_BACKSPACE, "0", LV_SYMBOL_OK, "\n",
-                                   "Sync :00", LV_SYMBOL_CLOSE, ""};
+                                   "Sync slot", LV_SYMBOL_CLOSE, ""};
 
 static void time_popup_close(void)
 {
@@ -342,9 +343,9 @@ static void time_btnm_cb(lv_event_t *e)
     {
         time_popup_close();
     }
-    else if (strcmp(txt, "Sync :00") == 0)
+    else if (strcmp(txt, "Sync slot") == 0)
     {
-        ft8_time_manual_sync_minute();
+        ft8_time_manual_sync_slot();
         time_popup_close();
         status_update();
     }
@@ -383,7 +384,7 @@ static void time_popup_open(void)
     lv_obj_remove_flag(s_time_popup, LV_OBJ_FLAG_SCROLLABLE);
 
     title = lv_label_create(s_time_popup);
-    lv_label_set_text(title, "UTC time, by eye: HHMMSS then OK");
+    lv_label_set_text(title, "HHMMSS UTC + OK, or Sync slot at :00/:15/:30/:45");
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 0);
 
     s_time_ta = lv_textarea_create(s_time_popup);

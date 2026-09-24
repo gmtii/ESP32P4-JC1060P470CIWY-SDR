@@ -29,7 +29,13 @@ idf_component_register(
     ft8/ft8_time.c
     ft8/time_sync.c
     ft8/ft8_band_sync.c
-    INCLUDE_DIRS .  ${INCLUDE_DIR} ft8
+    dmr/dmr_app.c
+    dmr/dmr_ui.c
+    dmr/dmr_demod.c
+    dmr/dmr_proto.c
+    dmr/dmr_fec.c
+    dmr/dmr_voice.c
+    INCLUDE_DIRS .  ${INCLUDE_DIR} ft8 dmr
     ) 
 
 idf_component_get_property(LVGL_LIB lvgl__lvgl COMPONENT_LIB)

@@ -19,6 +19,7 @@
 #include "rtl_source.h"
 #include "rtl_dsp.h"
 #include "ft8_app.h"
+#include "dmr_app.h"
 
 /* Uncomment to log the spectrum AGC's actual frame dB range once a second - see
  * sdr_priv.h's SPEC_AGC_DB_FLOOR/CEIL comment for why this is worth running on real
@@ -344,6 +345,12 @@ void IRAM_ATTR sdrTask(void *args)
         {
             float angle, x, y;
 
+            /* DMR tap: the raw 48 kS/s IQ, before this discriminator. The DMR
+             * task applies its own 12.5 kHz channel filter and discriminator
+             * (this NFM path has no channel filter at all). Only copies into a
+             * stream buffer; no-op unless DMR mode is on - see dmr/dmr_app.c. */
+            dmr_app_feed_iq(i_sample, q_sample, SAMPLE_BUFFER_SIZE);
+
             for (i = 0; i < SAMPLE_BUFFER_SIZE; i++)
             {
                 y = (q_sample[i] * fm_variables.i_sample_prev) - (i_sample[i] * fm_variables.q_sample_prev);
@@ -360,6 +367,13 @@ void IRAM_ATTR sdrTask(void *args)
 
                 fm_variables.q_sample_prev = q_sample[i]; // save "previous" value of each channel to allow detection of the change of angle in next go-around
                 fm_variables.i_sample_prev = i_sample[i];
+            }
+
+            /* DMR mode: replace the 4FSK hiss with the decoded voice (or
+             * silence, when there is none or mbelib is not compiled in). */
+            if (dmr_app_is_active())
+            {
+                dmr_app_read_audio(demod_out, SAMPLE_BUFFER_SIZE);
             }
         }
 

@@ -27,6 +27,7 @@
 #include "rtl_source.h"
 #include "uart_commands.h"
 #include "ft8_app.h"
+#include "dmr_app.h"
 
 #include "pins_config.h"
 
@@ -250,6 +251,9 @@ void app_main(void)
      * sdrTask starts and before init_ui() builds the FT8 panel. If it fails
      * the radio works as before, only the FT8 button does nothing. */
     ft8_app_init();
+
+    /* DMR receive mode, phase 1 (metadata). Same contract as FT8 above. */
+    dmr_app_init();
 
     bsp_i2c_init();
 

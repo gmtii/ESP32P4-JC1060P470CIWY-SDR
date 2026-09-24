@@ -61,7 +61,9 @@ Every decoded line also shows its own DT, using the WSJT-X convention
   HHMMSS, and press OK when a reference clock reaches it. Being a second or
   two off is fine. The decoder searches -1.6 to +3.2 s around the boundary,
   so the first slot usually decodes and the first correction lands the grid.
-  The **Sync :00** key in the same popup snaps to the nearest minute.
+  The **Sync slot** key in the same popup snaps to the nearest 15 s
+  boundary: press it when a reference clock shows :00, :15, :30 or :45.
+  That alone is enough for the band loop, which only needs the slot phase.
 - **Badly set clock.** If signals are HEARD but nothing decodes for 4 slots,
   the loop probes 0, +4, -4, +8 and -8 s around the time you set.
 - **No clock at all.** The loop sweeps the grid in 4 s steps every two slots

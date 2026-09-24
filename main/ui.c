@@ -34,6 +34,8 @@
 #include "ft8_ui.h"
 #include "ft8_time.h"
 #include "palettes.h"
+#include "dmr_app.h"
+#include "dmr_ui.h"
 #include "nvs_flash.h"
 #include "nvs.h"
 
@@ -215,9 +217,9 @@ void timer_dibuja_pantalla(lv_timer_t *timer)
       /* While the FT8 panel covers the spectrum/waterfall, calcula_fft()
        * above keeps running (the S-meter depends on it) but the hidden
        * redraws are skipped. */
-      if (ft8_ui_is_visible())
+      if (ft8_ui_is_visible() || dmr_ui_is_visible())
       {
-        covered_by_ft8 = true;
+        covered_by_ft8 = true; /* FT8 or DMR panel */
         lvgl_port_unlock();
         return;
       }
@@ -442,6 +444,8 @@ static void slider_changed_cb(lv_event_t *e)
  * ------------------------------------------------------------------------- */
 static lv_obj_t *btn_ft8;
 static lv_obj_t *label_ft8;
+static lv_obj_t *btn_dmr;   /* DMR button (see dmr_mode_toggle() below) - declared */
+static lv_obj_t *label_dmr; /* here because entering FT8 also has to switch DMR off */
 
 /* Standard FT8 dial frequencies (USB) and the band each one belongs to. On
  * entering FT8 the VFO snaps to the FT8 frequency of the band it is in; if it
@@ -509,6 +513,16 @@ static void ft8_mode_toggle(void)
   {
     const bool was_wfm = (demod_modo == DEMOD_WFM);
 
+    if (dmr_app_is_active())
+    {
+      /* leave DMR first (both modes take over the spectrum area) */
+      dmr_app_set_active(false);
+      dmr_ui_show(false);
+      if (label_dmr != NULL)
+      {
+        lv_label_set_text(label_dmr, "OFF");
+      }
+    }
     demod_modo = DEMOD_USB;
     currentVFO.demod_modo = DEMOD_USB;
     currentVFO.Frec = ft8_dial_for(currentVFO.Frec);
@@ -529,6 +543,62 @@ static void ft8_mode_toggle(void)
     ft8_ui_show(true);
   }
   ft8_button_refresh();
+}
+
+/* ---------------------------------------------------------------------------
+ * DMR mode (bottom-row DMR button). DSP side: dmr/dmr_app.c; panel: dmr_ui.c.
+ * Uses the NFM path, stays on the current frequency; FT8 and DMR exclude each
+ * other (both take over the spectrum area).
+ * ------------------------------------------------------------------------- */
+static void dmr_button_refresh(void)
+{
+  if (label_dmr != NULL)
+  {
+    lv_label_set_text(label_dmr, dmr_app_is_active() ? "ON" : "OFF");
+  }
+}
+
+static void dmr_exit_cb(void)
+{
+  dmr_button_refresh();
+}
+
+static void dmr_mode_toggle(void)
+{
+  if (!dmr_app_available())
+  {
+    ESP_LOGW(TAG, "DMR not available (init failed, see log)");
+    return;
+  }
+  if (dmr_app_is_active())
+  {
+    dmr_app_set_active(false);
+    dmr_ui_show(false);
+  }
+  else
+  {
+    const bool was_wfm = (demod_modo == DEMOD_WFM);
+
+    if (ft8_app_is_active())
+    {
+      ft8_mode_toggle(); /* leave FT8 first */
+    }
+    demod_modo = DEMOD_FM;
+    currentVFO.demod_modo = DEMOD_FM;
+    if (was_wfm)
+    {
+      rtl_source_set_gain_auto(false);
+      rtl_source_set_gain_db(menu_get_rtl_gain_db());
+    }
+    rtl_source_set_freq(currentVFO.Frec - lo_offset_for_mode(demod_modo));
+    lv_label_set_text_fmt(label_modos, "%s", demod_modos_texto[demod_modo]);
+    dibuja_pasabanda();
+    refresca_indicadores();
+
+    dmr_app_set_active(true);
+    dmr_ui_show(true);
+  }
+  dmr_button_refresh();
 }
 
 void btn_event_cb(lv_event_t *e)
@@ -629,6 +699,10 @@ void btn_event_cb(lv_event_t *e)
     else if (obj == btn_ft8)
     {
       ft8_mode_toggle();
+    }
+    else if (obj == btn_dmr)
+    {
+      dmr_mode_toggle();
     }
     else if (obj == btn5)
     {
@@ -761,6 +835,14 @@ void dibuja_botones(void)
 
   add_name_value_labels(btn_ft8, "FT8", &label_ft8);
   lv_label_set_text(label_ft8, "OFF");
+
+  /* --- Botón DMR: "DMR" / ON|OFF --- */
+  btn_dmr = lv_btn_create(screen);
+  style_ctrl_button(btn_dmr);
+  lv_obj_align(btn_dmr, LV_ALIGN_BOTTOM_LEFT, 10 + 5 * (UI_CTRL_BTN_W + UI_CTRL_BTN_GAP), -10);
+
+  add_name_value_labels(btn_dmr, "DMR", &label_dmr);
+  lv_label_set_text(label_dmr, "OFF");
 
   return;
 
@@ -1239,6 +1321,8 @@ void init_ui()
   /* FT8 panel last, so it sits above the canvases and the passband box. */
   ft8_ui_create(screen, UI_SPECTRUM_TOP_Y);
   ft8_ui_set_exit_callback(ft8_exit_cb);
+  dmr_ui_create(screen, UI_SPECTRUM_TOP_Y);
+  dmr_ui_set_exit_callback(dmr_exit_cb);
 }
 
 void smeter_set_dbm(float dbm)

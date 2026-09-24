@@ -333,9 +333,8 @@ static void btn12_cb(lv_event_t *e)
     if (lv_event_get_code(e) != LV_EVENT_CLICKED)
         return;
 
-    if (cont_menu && lv_obj_is_valid(cont_menu))
-    {
-        lv_obj_del_async(cont_menu);
+    if (cont_menu && lv_obj_is_valid(cont_menu)) {
+        lv_obj_del_async(cont_menu); 
 
         cont_menu = NULL;
 
@@ -578,18 +577,15 @@ static void freq_btnm_event_cb(lv_event_t *e)
             currentVFO.Frec = hz;
             refresca_VFO();
             rtl_source_set_freq(currentVFO.Frec - lo_offset_for_mode(demod_modo));
-            freq_popup_close();
-
-            inicia_timers();
         }
         return;
     }
 
     if (strcmp(txt, LV_SYMBOL_OK) == 0)
     {
-        // uint32_t hz = parse_freq(lv_textarea_get_text(ta_freq), 1e6);
-        // if (hz)
-        //     currentVFO.Frec = hz;
+        uint32_t hz = parse_freq(lv_textarea_get_text(ta_freq), 1e6);
+        if (hz)
+            currentVFO.Frec = hz;
         refresca_VFO();
         rtl_source_set_freq(currentVFO.Frec - lo_offset_for_mode(demod_modo));
         freq_popup_close();

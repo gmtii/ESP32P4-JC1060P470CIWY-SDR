@@ -64,8 +64,10 @@ void ft8_time_set_epoch_ms(int64_t epoch_ms, ft8_time_src_t src);
 /* Relative correction (MSG_SHIFT). Positive = clock moves forward. */
 void ft8_time_shift_ms(int32_t delta_ms, ft8_time_src_t src);
 
-/* SYNC :00 key: snap to the nearest whole minute (press at :00 of a reference). */
-void ft8_time_manual_sync_minute(void);
+/* "Sync slot" key: snap to the nearest 15 s boundary - press it when a
+ * reference clock shows :00, :15, :30 or :45. That is all the band-sync loop
+ * needs (it only cares about the slot phase). Minutes and hours are kept. */
+void ft8_time_manual_sync_slot(void);
 
 /* Manual time-of-day entry ("by eye", from the FT8 panel's TIME popup): sets
  * HH:MM:SS UTC and keeps the current date. A second or two of error is fine -

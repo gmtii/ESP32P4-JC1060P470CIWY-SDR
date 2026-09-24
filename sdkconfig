@@ -787,6 +787,13 @@ CONFIG_PARTITION_TABLE_MD5=y
 # end of Partition Table
 
 #
+# SDR: DMR
+#
+CONFIG_DMR_VOICE_MBELIB=y
+CONFIG_DMR_VOICE_UVQUALITY=3
+# end of SDR: DMR
+
+#
 # Compiler options
 #
 # CONFIG_COMPILER_OPTIMIZATION_DEBUG is not set

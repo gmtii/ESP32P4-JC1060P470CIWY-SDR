@@ -9,7 +9,7 @@
  * the spectrum + waterfall area (x=0, y=top_y, 1024 x 320) with:
  *   - a status line (clock + source, band-sync state and DT error, symbol
  *     progress, last-slot stats) and a TIME button: a keypad to set the UTC
- *     time of day by eye (plus a "Sync :00" key) - the band-sync loop does
+ *     time of day by eye (plus a "Sync slot" key for :00/:15/:30/:45) - the band-sync loop does
  *     the fine alignment,
  *   - an audio-frequency scale (0-1600 Hz, the FT8 search window),
  *   - a scrolling cascade of that window (4 px per 6.25 Hz bin = full width,

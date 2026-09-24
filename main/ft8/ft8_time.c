@@ -110,14 +110,14 @@ void ft8_time_shift_ms(int32_t delta_ms, ft8_time_src_t src)
     ft8_time_set_epoch_ms(ft8_time_now_ms() + delta_ms, src);
 }
 
-void ft8_time_manual_sync_minute(void)
+void ft8_time_manual_sync_slot(void)
 {
     int64_t ms = ft8_time_now_ms();
-    int64_t rem = ms % 60000;
+    int64_t rem = ms % 15000;
     ms -= rem;
-    if (rem >= 30000)
+    if (rem >= 7500)
     {
-        ms += 60000; /* pressed late in the minute: the :00 being marked is the next one */
+        ms += 15000; /* pressed late in the slot: the boundary being marked is the next one */
     }
     ft8_time_set_epoch_ms(ms, FT8_TIME_SRC_MANUAL);
 }
