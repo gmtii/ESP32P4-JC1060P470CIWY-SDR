@@ -46,6 +46,8 @@ static float s_up_hist[2 * (AUD_TAPS / AUD_RATE_UP)];
 static int s_up_idx;
 static bool s_playing; /* sdrTask side */
 static bool s_underrun_armed;   /* sdrTask side: a call is in progress */
+static bool s_fade_in;          /* sdrTask side: ramp the first samples after (re)start */
+#define AUD_RAMP 96             /* 2 ms at 48 kHz */
 static volatile uint32_t s_iq_drops, s_underruns;
 static volatile bool s_active;
 static bool s_available;
@@ -149,8 +151,9 @@ static void dmr_task(void *arg)
             uint32_t frames, avg_us;
             next_stats = esp_timer_get_time() + 10000000;
             dmr_voice_get_timing(&frames, &avg_us);
-            ESP_LOGI(TAG, "stats: IQ blocks dropped %lu, audio underruns %lu, vocoder %lu frames avg %lu us/frame (budget 20000)",
-                     (unsigned long)s_iq_drops, (unsigned long)s_underruns, (unsigned long)frames, (unsigned long)avg_us);
+            ESP_LOGI(TAG, "stats: IQ blocks dropped %lu, audio underruns %lu, vocoder %lu frames avg %lu us/frame (budget 20000), concealed %lu",
+                     (unsigned long)s_iq_drops, (unsigned long)s_underruns, (unsigned long)frames, (unsigned long)avg_us,
+                     (unsigned long)dmr_voice_get_concealed());
         }
     }
 }
@@ -254,14 +257,30 @@ void dmr_app_read_audio(float *out, size_t n)
         if (!s_playing && avail >= (s_underrun_armed ? AUD_REBUFFER : AUD_PREBUFFER))
         {
             s_playing = true;
+            s_fade_in = true;
             s_underrun_armed = true;
         }
         if (s_playing)
         {
             got = xStreamBufferReceive(s_aud, out, n * sizeof(float), 0) / sizeof(float);
+            if (s_fade_in)
+            {
+                /* 2 ms fade-in: no click when speech (re)starts */
+                for (size_t k = 0; k < got && k < AUD_RAMP; k++)
+                {
+                    out[k] *= (float)k / AUD_RAMP;
+                }
+                s_fade_in = false;
+            }
             if (got < n)
             {
-                /* underrun: a gap in the call (short re-buffer) or its end */
+                /* underrun: a gap in the call (short re-buffer) or its end.
+                 * 2 ms fade-out on what we have, so it stops without a click. */
+                size_t r = got < AUD_RAMP ? got : AUD_RAMP;
+                for (size_t k = 0; k < r; k++)
+                {
+                    out[got - r + k] *= (float)(r - k) / (float)r;
+                }
                 s_playing = false;
                 s_underruns++;
             }

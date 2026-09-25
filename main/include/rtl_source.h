@@ -48,7 +48,15 @@ typedef struct {
 /* initial_lo_hz: LO frequency (VFO - 12 kHz). initial_gain_db: manual tuner gain. */
 esp_err_t rtl_source_init(uint32_t initial_lo_hz, int initial_gain_db);
 
-/* Request a new LO frequency; the latest request wins. */
+/*
+ * Request a new LO frequency; the latest request wins. Cheap and non-blocking.
+ * Within RTL_SOURCE_DIGITAL_WINDOW_HZ (24 kHz) of the dongle's physical LO the
+ * change is made by an NCO in rtl_dsp.c: instant, the USB I/Q stream never
+ * stops (dragging the spectrum or spinning the encoder no longer freezes the
+ * display). Beyond it, or in WFM mode, the dongle is retuned physically, which
+ * briefly pauses the stream. After tuning has been idle for
+ * RTL_SOURCE_RECENTRE_MS the dongle is re-centred once and the offset dropped.
+ */
 void rtl_source_set_freq(uint32_t lo_hz);
 
 /* Manual tuner gain (0..49 dB, nearest step) or the tuner's own AGC. */

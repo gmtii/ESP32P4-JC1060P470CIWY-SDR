@@ -74,6 +74,14 @@ typedef struct {
     bool conjugate;         /* negate Q on output (flip spectrum orientation) */
     bool wide;              /* true: emit at RTL_DSP_WIDE_RATE, skip the FIR decimator */
     uint32_t out_dropped;   /* frames lost because max_out was too small      */
+
+    /* Digital fine tuning: NCO applied right after the CIC (exactly 192 kSps on
+     * the dongle's clock, i.e. before the drift resampler, so the shift is exact
+     * in Hz). Phase-continuous: changing the offset only changes the increment. */
+    int32_t nco_offset_hz;  /* 0 = NCO bypassed (bit-identical to no NCO)    */
+    float nco_c, nco_s;     /* current phasor                                */
+    float nco_dc, nco_ds;   /* per-sample rotation                           */
+    uint32_t nco_renorm;    /* samples since the phasor was renormalized     */
 } rtl_dsp_t;
 
 /* Reset all state and (re)design the FIR. conjugate: see above. */
@@ -91,6 +99,16 @@ void rtl_dsp_set_step(rtl_dsp_t *d, float step);
  * modes in a FIFO that assumes one constant frame duration - see rtl_source_set_wide().
  */
 void rtl_dsp_set_wide(rtl_dsp_t *d, bool wide);
+
+/*
+ * Digital retune: shift the signal so that what sits offset_hz above the
+ * hardware LO comes out at the centre - the same result as retuning the dongle
+ * by offset_hz, without stopping the USB stream. Applied before the 192 -> 48 kSps
+ * FIR, which keeps +-24 kHz, so |offset_hz| must stay well inside +-96 kHz
+ * (rtl_source.c keeps it within RTL_SOURCE_DIGITAL_WINDOW_HZ). Safe to call
+ * between rtl_dsp_process() calls; the phase is continuous.
+ */
+void rtl_dsp_set_offset(rtl_dsp_t *d, int32_t offset_hz);
 
 /*
  * Convert n_bytes of interleaved CU8 (I0,Q0,I1,Q1,...) to 48 kSps frames.

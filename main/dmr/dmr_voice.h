@@ -51,4 +51,7 @@ int dmr_voice_get_playing(void);
  * a 20 ms frame must take well under 20 ms, shared with everything else. */
 void dmr_voice_get_timing(uint32_t *frames, uint32_t *avg_us);
 
+/* Frames attenuated by the burst concealment (corrupted-frame squawks). */
+uint32_t dmr_voice_get_concealed(void);
+
 #endif /* DMR_VOICE_H */

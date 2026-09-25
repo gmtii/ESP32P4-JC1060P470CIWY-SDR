@@ -50,6 +50,24 @@ static const char *TAG = "rtl_source";
  * retry makes the driver replay its whole demodulator init table on an already
  * configured dongle (EP0 STALLs), so wait much longer than for a missing device. */
 #ifndef RTL_SOURCE_RETRY_MS
+/*
+ * Digital tuning window: frequency changes within +-this of the hardware LO are
+ * done by the NCO in rtl_dsp (instant, the USB stream never stops). Only a
+ * change beyond it - or any change in WFM, which uses the full 192 kSps band -
+ * retunes the dongle physically, which pauses, drains and resubmits the bulk
+ * pipeline (that pause is what froze the spectrum and waterfall while dragging).
+ * +-24 kHz keeps the CIC droop under ~2 dB at the channel edge.
+ */
+#define RTL_SOURCE_DIGITAL_WINDOW_HZ 24000
+/*
+ * Once tuning has been idle this long with a digital offset in place, retune
+ * the dongle to the wanted frequency once and drop the offset: that restores
+ * the full CIC alias rejection (about -67 dB instead of ~-40 dB for signals
+ * ~140 kHz away at the window edge). One short stream pause, only after you
+ * stop tuning. 0 disables it.
+ */
+#define RTL_SOURCE_RECENTRE_MS 1500u
+
 #define RTL_SOURCE_RETRY_MS       500u
 #endif
 #ifndef RTL_SOURCE_NOMEM_RETRY_MS
@@ -105,6 +123,13 @@ static struct {
 
     volatile uint32_t want_lo_hz;
     volatile bool     lo_pending;
+    /* Digital fine tuning (see rtl_source_set_freq()): hw_lo_hz is where the
+     * dongle is physically tuned; dig_offset_hz = want - hw is applied by the
+     * NCO in rtl_dsp from the delivery callback, without touching the stream. */
+    volatile uint32_t hw_lo_hz;
+    volatile bool     hw_valid;
+    volatile int32_t  dig_offset_hz;
+    volatile int64_t  last_tune_us;                 /* time of the last rtl_source_set_freq() */
     volatile int      want_gain_db;
     volatile bool     want_gain_auto;
     volatile bool     gain_pending;
@@ -120,6 +145,9 @@ static struct {
 static void process_block(const uint8_t *data, size_t bytes)
 {
     int16_t out[2 * OUT_CHUNK_FRAMES];
+
+    /* digital fine tuning: cheap, phase-continuous, no-op when unchanged */
+    rtl_dsp_set_offset(&S.dsp, __atomic_load_n(&S.dig_offset_hz, __ATOMIC_ACQUIRE));
 
     if (__atomic_exchange_n(&S.wide_pending, false, __ATOMIC_ACQUIRE)) {
         const bool wide = S.want_wide;
@@ -218,6 +246,10 @@ static bool start_stream(void)
 
     rtl_dsp_init(&S.dsp, RTL_SOURCE_CONJUGATE_IQ != 0);
     rtl_dsp_set_wide(&S.dsp, S.want_wide);
+    /* (re)starting tunes the dongle to the wanted frequency: no digital offset */
+    S.hw_lo_hz = S.want_lo_hz;
+    __atomic_store_n(&S.dig_offset_hz, 0, __ATOMIC_RELEASE);
+    S.hw_valid = true;
     S.wide = S.want_wide;
     S.rate_mult = S.wide ? (RTL_DSP_WIDE_RATE / RTL_DSP_OUT_RATE) : 1u;
     S.target_raw = RTL_RATE_TARGET_FRAMES * S.rate_mult;
@@ -312,6 +344,14 @@ static void ctl_task(void *arg)
 
         ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(250));
 
+#if RTL_SOURCE_RECENTRE_MS > 0
+        /* Idle with a digital offset in place: one physical retune to recentre. */
+        if (__atomic_load_n(&S.dig_offset_hz, __ATOMIC_ACQUIRE) != 0 &&
+            (esp_timer_get_time() - S.last_tune_us) > (int64_t)RTL_SOURCE_RECENTRE_MS * 1000) {
+            __atomic_store_n(&S.lo_pending, true, __ATOMIC_RELEASE);
+        }
+#endif
+
         if (S.fault || esp_rtl_sdr_get_state(S.sdr) != ESP_RTL_SDR_STATE_STREAMING) {
             recover();
             continue;
@@ -331,6 +371,27 @@ static void ctl_task(void *arg)
 #endif
             if (err != ESP_OK) {
                 ESP_LOGW(TAG, "retune %u Hz failed: %s", (unsigned)lo, esp_rtl_sdr_err_to_name(err));
+            } else {
+                /* The dongle is now at lo. Whatever was requested meanwhile stays
+                 * digital if it is within the window of the new LO. */
+                S.hw_lo_hz = lo;
+                const int32_t rest = (int32_t)(S.want_lo_hz - lo);
+                if (rest == 0) {
+                    /* on target: nothing left to do (this is ALWAYS the case in WFM
+                     * after its own retune - the first version of this code sent
+                     * rest == 0 in wide mode to the "retune again" branch below and
+                     * looped forever, freezing the spectrum on entering WFM) */
+                    __atomic_store_n(&S.dig_offset_hz, 0, __ATOMIC_RELEASE);
+                } else if (!S.want_wide && rest >= -RTL_SOURCE_DIGITAL_WINDOW_HZ &&
+                           rest <= RTL_SOURCE_DIGITAL_WINDOW_HZ) {
+                    /* moved a little further meanwhile: finish digitally */
+                    __atomic_store_n(&S.dig_offset_hz, rest, __ATOMIC_RELEASE);
+                } else {
+                    /* moved beyond the window (or WFM moved on): one more real retune */
+                    __atomic_store_n(&S.dig_offset_hz, 0, __ATOMIC_RELEASE);
+                    __atomic_store_n(&S.lo_pending, true, __ATOMIC_RELEASE);
+                    xTaskNotifyGive(S.ctl);
+                }
             }
         }
         if (__atomic_exchange_n(&S.gain_pending, false, __ATOMIC_ACQUIRE)) {
@@ -379,6 +440,18 @@ esp_err_t rtl_source_init(uint32_t initial_lo_hz, int initial_gain_db)
 void rtl_source_set_freq(uint32_t lo_hz)
 {
     S.want_lo_hz = lo_hz;
+    S.last_tune_us = esp_timer_get_time();
+
+    /* Within the digital window of the hardware LO (and not in WFM, which needs
+     * the whole 192 kSps band): move the NCO only - instant, stream untouched.
+     * A physical retune already in flight picks up the final value itself. */
+    if (S.hw_valid && !S.want_wide && !__atomic_load_n(&S.lo_pending, __ATOMIC_ACQUIRE)) {
+        const int32_t d = (int32_t)(lo_hz - S.hw_lo_hz);
+        if (d >= -RTL_SOURCE_DIGITAL_WINDOW_HZ && d <= RTL_SOURCE_DIGITAL_WINDOW_HZ) {
+            __atomic_store_n(&S.dig_offset_hz, d, __ATOMIC_RELEASE);
+            return;
+        }
+    }
     __atomic_store_n(&S.lo_pending, true, __ATOMIC_RELEASE);
     if (S.ctl != NULL) {
         xTaskNotifyGive(S.ctl);
@@ -404,6 +477,13 @@ void rtl_source_set_wide(bool wide)
     }
     S.want_wide = wide;
     __atomic_store_n(&S.wide_pending, true, __ATOMIC_RELEASE);
+    if (wide && __atomic_load_n(&S.dig_offset_hz, __ATOMIC_ACQUIRE) != 0) {
+        /* WFM uses the whole 192 kSps band: centre the dongle, drop the offset */
+        __atomic_store_n(&S.lo_pending, true, __ATOMIC_RELEASE);
+        if (S.ctl != NULL) {
+            xTaskNotifyGive(S.ctl);
+        }
+    }
     /* No need to wake anyone: process_block() picks this up on its own very next
      * call, which arrives every ~8.5 ms regardless (USB delivery keeps running
      * unconditionally - a mode switch never stops or restarts the dongle). */

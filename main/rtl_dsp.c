@@ -58,6 +58,23 @@ void rtl_dsp_set_step(rtl_dsp_t *d, float step)
     d->step = step;
 }
 
+void rtl_dsp_set_offset(rtl_dsp_t *d, int32_t offset_hz)
+{
+    if (offset_hz == d->nco_offset_hz) {
+        return;
+    }
+    if (d->nco_offset_hz == 0) {
+        d->nco_c = 1.0f;   /* NCO was bypassed: start from phase 0 */
+        d->nco_s = 0.0f;
+        d->nco_renorm = 0;
+    }
+    /* multiply by e^{-j 2 pi offset t}: moves the component at +offset to 0 Hz */
+    const double w = -2.0 * 3.14159265358979323846 * (double)offset_hz / (double)RTL_DSP_MID_RATE;
+    d->nco_dc = (float)cos(w);
+    d->nco_ds = (float)sin(w);
+    d->nco_offset_hz = offset_hz;
+}
+
 void rtl_dsp_set_wide(rtl_dsp_t *d, bool wide)
 {
     d->wide = wide;
@@ -112,8 +129,26 @@ size_t rtl_dsp_process(rtl_dsp_t *d, const uint8_t *cu8, size_t n_bytes,
             t = ci; ci -= d->comb_i[s]; d->comb_i[s] = t;
             t = cq; cq -= d->comb_q[s]; d->comb_q[s] = t;
         }
-        const float fi = (float)(int32_t)ci * CIC_NORM;
-        const float fq = (float)(int32_t)cq * CIC_NORM;
+        float fi = (float)(int32_t)ci * CIC_NORM;
+        float fq = (float)(int32_t)cq * CIC_NORM;
+
+        /* --- digital fine tuning (NCO), see rtl_dsp_set_offset() --- */
+        if (d->nco_offset_hz != 0) {
+            const float c = d->nco_c, s = d->nco_s;
+            const float ri = fi * c - fq * s;
+            const float rq = fi * s + fq * c;
+            fi = ri;
+            fq = rq;
+            d->nco_c = c * d->nco_dc - s * d->nco_ds;
+            d->nco_s = c * d->nco_ds + s * d->nco_dc;
+            if (++d->nco_renorm >= 1024u) {
+                /* keep |phasor| = 1 against float rounding drift */
+                const float g = 1.5f - 0.5f * (d->nco_c * d->nco_c + d->nco_s * d->nco_s);
+                d->nco_c *= g;
+                d->nco_s *= g;
+                d->nco_renorm = 0;
+            }
+        }
 
         /* --- cubic interpolator, variable delay --- */
         d->hist_i[0] = d->hist_i[1]; d->hist_i[1] = d->hist_i[2];

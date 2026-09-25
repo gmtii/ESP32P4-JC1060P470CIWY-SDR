@@ -958,7 +958,15 @@ void dibuja_botones(void)
  * generate anywhere close to the retune rate a fast finger swipe can - this
  * throttle just brings touch dragging down to a similarly gentle retune rate.
  */
-#define SPECTRUM_DRAG_RETUNE_MIN_US 80000 /* ~12.5 Hz max actual retune rate; a starting value, not measured against how long a real retune here takes to drain+resubmit - raise it if the freeze is still visible, lower it if retuning feels laggy */
+/*
+ * UPDATE: rtl_source_set_freq() now retunes digitally (NCO in rtl_dsp.c, no USB
+ * pause) whenever the new frequency is within RTL_SOURCE_DIGITAL_WINDOW_HZ of the
+ * dongle's physical LO, and re-centres the dongle once, only after tuning has
+ * been idle for a moment. Dragging therefore no longer stops the I/Q stream, so
+ * this throttle is disabled (0): every drag step is applied at once. It is kept
+ * only as a knob in case a physical-retune-heavy use ever needs it again.
+ */
+#define SPECTRUM_DRAG_RETUNE_MIN_US 0
 
 static void spectrum_drag_apply_freq(void)
 {

@@ -182,6 +182,27 @@ rising. The cause was the BS slot assignment, not the CPU.
 - **Note on `und`.** It also counts the normal drain at the end of each
   call.
 
+### Short loud squawks (concealment)
+
+On weak or fading signals, mbelib occasionally synthesises a corrupted frame
+as a loud 20 ms burst, sometimes at full scale. This was reproduced on the
+host by re-transmitting the real AMBE frames of the capture through the
+synthetic channel at 6 dB SNR. Every such burst had a few corrected errors
+(errs2 1-3) and several times the energy of the speech around it.
+
+`dmr_voice.c` now handles it in three ways:
+
+- **Concealment.** A frame with corrected errors whose rms exceeds 2x the
+  recent error-free speech level is scaled down to that level. Error-free
+  frames, and errored frames of normal energy, are left untouched.
+- **Soft limiter.** It replaces the hard clip at ±1. It touches 0.07 % of
+  clean speech samples.
+- **Fades.** 2 ms fade-in and fade-out at playout start and at underruns
+  avoid clicks.
+
+At 6 dB, this removed the full-scale bursts and left no clipped frames. The
+status line shows `conc`, the count of concealed frames.
+
 Verification: the speech of the real capture was decoded and compared with
 dsd-fme at the level of the 49-bit AMBE parameters, not the audio. mbelib
 synthesises unvoiced sounds from random noise, and dsd-fme adds its own gain

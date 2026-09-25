@@ -185,9 +185,10 @@ static void status_update(const dmr_demod_status_t *ds)
         dmr_voice_get_timing(&frames, &us);
         if (dmr_voice_available())
         {
-            snprintf(buf, sizeof(buf), "DMR  %s%s | offset %+.0f Hz dev %.0f | voice %s | voc %.1f ms/f  drop %lu  und %lu",
+            snprintf(buf, sizeof(buf), "DMR %s%s | off %+.0f Hz dev %.0f | voice %s | voc %.1f ms drop %lu und %lu conc %lu",
                      ds->bs ? "BS" : ds->ms ? "MS" : "DM", ds->inverted ? " INV" : "", ds->dc, ds->level,
-                     pref == 0 ? "TS1" : pref == 1 ? "TS2" : "auto", us / 1000.0f, (unsigned long)drops, (unsigned long)und);
+                     pref == 0 ? "TS1" : pref == 1 ? "TS2" : "auto", us / 1000.0f, (unsigned long)drops, (unsigned long)und,
+                     (unsigned long)dmr_voice_get_concealed());
         }
         else
         {

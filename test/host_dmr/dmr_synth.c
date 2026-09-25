@@ -10,6 +10,12 @@
  *     block 1), terminators; a CSBK on TS1 at the end.
  * ms: the same call as an MS sourced (simplex) stream, bursts every 60 ms.
  *
+ * Environment:
+ *   DMR_SYNTH_SF=n      voice superframes in the call (default 4)
+ *   DMR_SYNTH_AMBE=f    replay real voice bursts (132 dibits each, as written
+ *                       by a -DDMR_VOICE_BURST_DUMP decode) instead of random
+ *                       AMBE bits - lets speech quality be judged at low SNR
+ *
  * Writes:
  *   out_prefix.cf32  interleaved float32 IQ at 48 kS/s as the ESP32-P4 board's
  *                    rtl_source delivers it: CONJUGATED (channel 12 kHz below
@@ -34,6 +40,8 @@ static const uint64_t SYNC_BS_VOICE = 0x755FD7DF75F7ull, SYNC_BS_DATA = 0xDFF57D
 static const uint64_t SYNC_MS_VOICE = 0x7F7D5DD57DFDull, SYNC_MS_DATA = 0xD5D7F77FD757ull;
 
 static uint8_t dibits[MAXSYM];
+static uint8_t *g_real_ambe;
+static int g_real_n, g_real_pos;
 static uint8_t keyed[MAXSYM]; /* 0 = transmitter off (MS gaps) */
 static int nsym;
 static int ms_mode;
@@ -111,6 +119,14 @@ static void voice_superframe(int slot, int cc, const uint8_t lc72[72], int idle_
     {
         uint8_t a[108], b[108], c[48];
         for (int i = 0; i < 108; i++) { a[i] = rand() & 1; b[i] = rand() & 1; } /* AMBE placeholder */
+        if (g_real_ambe != NULL && g_real_n > 0)
+        {
+            /* DMR_SYNTH_AMBE=file: real voice bursts (132 dibits each, from a
+             * DMR_VOICE_BURST_DUMP decode) - replay their AMBE payload */
+            const uint8_t *vb = &g_real_ambe[132 * (g_real_pos++ % g_real_n)];
+            for (int i = 0; i < 54; i++) { a[2 * i] = (vb[i] >> 1) & 1; a[2 * i + 1] = vb[i] & 1; }
+            for (int i = 0; i < 54; i++) { b[2 * i] = (vb[78 + i] >> 1) & 1; b[2 * i + 1] = vb[78 + i] & 1; }
+        }
         if (k == 0)
         {
             u64_bits(ms_mode ? SYNC_MS_VOICE : SYNC_BS_VOICE, 48, c);
@@ -150,6 +166,19 @@ int main(int argc, char **argv)
     if (argc < 3) { fprintf(stderr, "usage: %s bs|ms prefix [snr_db] [freq_err_hz]\n", argv[0]); return 1; }
     ms_mode = !strcmp(argv[1], "ms");
     srand(1234);
+    if (getenv("DMR_SYNTH_AMBE"))
+    {
+        FILE *af = fopen(getenv("DMR_SYNTH_AMBE"), "rb");
+        if (af)
+        {
+            fseek(af, 0, SEEK_END);
+            long sz = ftell(af);
+            fseek(af, 0, SEEK_SET);
+            g_real_ambe = malloc((size_t)sz);
+            g_real_n = (int)(fread(g_real_ambe, 1, (size_t)sz, af) / 132);
+            fclose(af);
+        }
+    }
 
     /* preamble: idle bursts so the receiver can lock (BS) / silence (MS) */
     for (int k = 0; k < 8; k++)

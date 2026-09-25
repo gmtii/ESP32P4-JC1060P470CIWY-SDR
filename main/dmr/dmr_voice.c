@@ -1,7 +1,7 @@
 #include "dmr_voice.h"
 
 #include <string.h>
-#ifdef DMR_VOICE_TRACE
+#if defined(DMR_VOICE_TRACE) || defined(DMR_VOICE_BURST_DUMP)
 #include <stdio.h>
 #endif
 
@@ -37,6 +37,7 @@ int dmr_voice_get_playing(void)
 #ifndef DMR_VOICE_ENABLED
 /* ---- mbelib not enabled: metadata-only build ------------------------------ */
 void dmr_voice_get_timing(uint32_t *frames, uint32_t *avg_us) { *frames = 0; *avg_us = 0; }
+uint32_t dmr_voice_get_concealed(void) { return 0; }
 bool dmr_voice_available(void) { return false; }
 void dmr_voice_set_sink(dmr_voice_sink_t sink) { (void)sink; }
 void dmr_voice_reset(void) { s_playing = -1; }
@@ -50,6 +51,7 @@ void dmr_voice_set_encrypted(int slot, bool enc) { (void)slot; (void)enc; }
 #else
 /* ---- mbelib voice ------------------------------------------------------------ */
 #include "mbelib.h"
+#include <math.h>
 
 /*
  * DMR AMBE+2 interleave schedule, from DSD (Copyright (C) 2010 DSD Author,
@@ -88,12 +90,49 @@ typedef struct
     mbe_parms cur, prev, prev_enh;
     bool enc;
     uint32_t last_voice_ms;
+    float level; /* running rms of recent error-free frames (concealment reference) */
 } vslot_t;
+
+/*
+ * Burst concealment. On weak or fading signals mbelib sometimes synthesises a
+ * frame whose parameters were corrupted beyond what its FEC reports: it still
+ * counts a few corrected errors (errs2 1-3), but the output is a loud 20 ms
+ * squawk, sometimes at full scale. Host test (real AMBE frames re-transmitted
+ * at 6 dB SNR): every such burst had errs2 > 0 and several times the energy of
+ * the speech around it. So: a frame WITH corrected errors whose rms jumps
+ * above CONCEAL_RATIO x the recent clean level is scaled down to that level.
+ * Error-free frames (and errored frames of normal energy, usually decoded
+ * correctly) are left untouched; only error-free frames update the level.
+ */
+#define CONCEAL_RATIO 2.0f
+#define CONCEAL_FLOOR 0.02f   /* never treat near-silence as a reference */
+#define LEVEL_ALPHA 0.1f      /* per 20 ms frame */
+static volatile uint32_t s_concealed;
+
+/* Soft limiter: linear to 0.7, then a smooth knee toward 1.0 (no hard clip). */
+static inline float soft_limit(float v)
+{
+    const float a = v < 0.0f ? -v : v;
+    if (a <= 0.7f)
+    {
+        return v;
+    }
+    {
+        const float over = (a - 0.7f) / 0.3f;
+        const float y = 0.7f + 0.3f * (over / (1.0f + over)); /* -> 1.0 asymptotically */
+        return v < 0.0f ? -y : y;
+    }
+}
 
 static vslot_t s_v[2];
 static dmr_voice_sink_t s_sink;
 
 bool dmr_voice_available(void) { return true; }
+
+uint32_t dmr_voice_get_concealed(void)
+{
+    return s_concealed;
+}
 
 void dmr_voice_get_timing(uint32_t *frames, uint32_t *avg_us)
 {
@@ -160,10 +199,32 @@ static void decode_frame(int slot, const uint8_t *dib)
         dmr_voice_ambe_dump(ambe_d, errs2);
     }
 #endif
-    for (int k = 0; k < 160; k++)
     {
-        float v = pcm[k] * OUT_SCALE;
-        pcm[k] = v > 1.0f ? 1.0f : (v < -1.0f ? -1.0f : v);
+        float e = 0.0f, rms;
+        vslot_t *v = &s_v[slot];
+        for (int k = 0; k < 160; k++)
+        {
+            pcm[k] *= OUT_SCALE;
+            e += pcm[k] * pcm[k];
+        }
+        rms = sqrtf(e / 160.0f);
+        if (errs2 > 0 && v->level > 0.0f && rms > CONCEAL_RATIO * v->level + CONCEAL_FLOOR)
+        {
+            const float g = (v->level + CONCEAL_FLOOR) / rms;
+            for (int k = 0; k < 160; k++)
+            {
+                pcm[k] *= g;
+            }
+            s_concealed++;
+        }
+        else if (errs2 == 0)
+        {
+            v->level += LEVEL_ALPHA * (rms - v->level);
+        }
+        for (int k = 0; k < 160; k++)
+        {
+            pcm[k] = soft_limit(pcm[k]);
+        }
     }
     if (s_sink != NULL)
     {
@@ -178,6 +239,14 @@ void dmr_voice_burst(int slot, const uint8_t burst[132], int voice_idx, uint32_t
     (void)voice_idx;
 #ifdef DMR_VOICE_TRACE
     printf("VTRACE %u slot %d idx %d playing %d\n", (unsigned)t_ms, slot, voice_idx, s_playing);
+#endif
+#ifdef DMR_VOICE_BURST_DUMP
+    { /* host test only: raw voice bursts (132 dibits each) for re-transmission tests */
+        static FILE *bf;
+        if (!bf) bf = fopen("voice_bursts.bin", "wb");
+        fwrite(burst, 1, 132, bf);
+        fflush(bf);
+    }
 #endif
 
     /* drop a stalled playing slot */
