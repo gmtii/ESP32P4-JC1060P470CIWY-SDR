@@ -599,3 +599,19 @@ void ft8_decoder_process_slot(void)
         s_last_num_decoded++;
     }
 }
+
+bool ft8_decoder_get_own_latlon(float *lat, float *lon)
+{
+    if (!s_own_latlon_valid)
+    {
+        return false;
+    }
+    *lat = s_own_lat;
+    *lon = s_own_lon;
+    return true;
+}
+
+float ft8_distance_km(float lat1, float lon1, float lat2, float lon2)
+{
+    return haversine_km(lat1, lon1, lat2, lon2);
+}

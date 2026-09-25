@@ -30,6 +30,7 @@ enum
     FLCO_TA_HEADER = 0x04,
     FLCO_TA_BLOCK1 = 0x05,
     FLCO_TA_BLOCK3 = 0x07,
+    FLCO_GPS_INFO = 0x08,
 };
 
 /* CACH -> TACT: the 7 TACT bits are CACH bits 0,4,8,12,14,18,22 (ETSI TS
@@ -67,6 +68,7 @@ static bool s_proven;
  * errors "corrects" to the wrong word; trusting it alone sent voice bursts to
  * the other slot and let that slot's idle burst cut the superframe short. */
 static int s_tact_disagree;
+static bool s_slot_phase_known; /* false right after (re)lock: trust the first good TACT */
 static dmr_log_entry_t s_log[DMR_LOG_LEN];
 static int s_log_count;
 static uint32_t s_log_seq;
@@ -115,6 +117,7 @@ void dmr_proto_reset(void)
     s_ms_mode = false;
     s_proven = false;
     s_tact_disagree = 0;
+    s_slot_phase_known = false;
     memset(s_log, 0, sizeof(s_log));
     s_log_count = 0;
     memset(&s_stats, 0, sizeof(s_stats));
@@ -174,7 +177,98 @@ static void log_new_call(int slot_idx, uint32_t t_ms)
     e->dst = si->dst;
     e->src = si->src;
     snprintf(e->alias, sizeof(e->alias), "%s", si->alias);
+    e->gps_valid = si->gps_valid;
+    e->gps_lat = si->gps_lat;
+    e->gps_lon = si->gps_lon;
+    memcpy(e->gps_grid, si->gps_grid, sizeof(e->gps_grid));
     e->seq = ++s_log_seq;
+}
+
+static void log_update_gps(int slot_idx)
+{
+    const dmr_slot_info_t *si = &s_slot[slot_idx].info;
+    for (int i = s_log_count - 1; i >= 0; i--)
+    {
+        if (s_log[i].slot == slot_label(slot_idx) && s_log[i].src == si->src)
+        {
+            s_log[i].gps_valid = true;
+            s_log[i].gps_lat = si->gps_lat;
+            s_log[i].gps_lon = si->gps_lon;
+            memcpy(s_log[i].gps_grid, si->gps_grid, sizeof(s_log[i].gps_grid));
+            s_log[i].seq = ++s_log_seq;
+            return;
+        }
+    }
+}
+
+void dmr_latlon_to_grid(float lat, float lon, char out[7])
+{
+    float x = lon + 180.0f, y = lat + 90.0f;
+    if (x < 0.0f) x = 0.0f;
+    if (x >= 360.0f) x = 359.9999f;
+    if (y < 0.0f) y = 0.0f;
+    if (y >= 180.0f) y = 179.9999f;
+    out[0] = (char)('A' + (int)(x / 20.0f));
+    out[1] = (char)('A' + (int)(y / 10.0f));
+    out[2] = (char)('0' + (int)(x / 2.0f) % 10);
+    out[3] = (char)('0' + (int)y % 10);
+    out[4] = (char)('a' + (int)((x - 2.0f * (int)(x / 2.0f)) * 12.0f));
+    out[5] = (char)('a' + (int)((y - (int)y) * 24.0f));
+    out[6] = '\0';
+}
+
+/* Two's complement field of n bits (MSB first) as a signed value. */
+static int32_t sfield(const uint8_t *bits, int n)
+{
+    uint32_t v = dmr_bits_to_u32(bits, n);
+    if (v & (1u << (n - 1)))
+    {
+        return (int32_t)v - (int32_t)(1u << n);
+    }
+    return (int32_t)v;
+}
+
+/*
+ * GPS Info LC (ETSI TS 102 361-2, FLCO 0x08), 72 bits:
+ *   0-15 PF/R/FLCO/FID, 16-19 reserved, 20-22 position error (2*10^n m, 7 =
+ *   unknown), 23-47 longitude (25-bit two's complement, 360/2^25 deg/LSB),
+ *   48-71 latitude (24-bit two's complement, 180/2^24 deg/LSB) - about 1-2 m.
+ * Checked against dsd-fme's dmr_embedded_gps(); unlike it, the sign is undone
+ * as exact two's complement (its "0x800001 - value" is one LSB off).
+ */
+static void apply_gps_lc(int slot_idx, const uint8_t lc[72], uint32_t t_ms)
+{
+    slot_state_t *st = &s_slot[slot_idx];
+    int err = (int)dmr_bits_to_u32(&lc[20], 3);
+    float lon = (float)sfield(&lc[23], 25) * (360.0f / 33554432.0f);
+    float lat = (float)sfield(&lc[48], 24) * (180.0f / 16777216.0f);
+    (void)t_ms;
+
+    if (lat <= -90.0f || lat >= 90.0f || lon <= -180.0f || lon >= 180.0f)
+    {
+        return;
+    }
+    st->info.gps_valid = true;
+    st->info.gps_lat = lat;
+    st->info.gps_lon = lon;
+    st->info.gps_err_m = (err == 7) ? -1 : (err == 0 ? 2 : (err == 1 ? 20 : (err == 2 ? 200 : (err == 3 ? 2000 : (err == 4 ? 20000 : 200000)))));
+    dmr_latlon_to_grid(lat, lon, st->info.gps_grid);
+    s_stats.gps++;
+    log_update_gps(slot_idx);
+    {
+        char errs[24];
+        if (st->info.gps_err_m < 0)
+        {
+            snprintf(errs, sizeof(errs), "error unknown");
+        }
+        else
+        {
+            snprintf(errs, sizeof(errs), "+-%d m", st->info.gps_err_m);
+        }
+        printf_line("        TS%d GPS %.5f%c %.5f%c  %s  %s", slot_label(slot_idx),
+                    lat < 0 ? -lat : lat, lat < 0 ? 'S' : 'N', lon < 0 ? -lon : lon, lon < 0 ? 'W' : 'E',
+                    st->info.gps_grid, errs);
+    }
 }
 
 static void log_update_alias(int slot_idx)
@@ -212,9 +306,10 @@ static void apply_voice_lc(int slot_idx, const uint8_t bytes[9], uint32_t t_ms, 
 
     if (changed && st->info.src != src)
     {
-        /* new talker: forget the previous one's alias */
+        /* new talker: forget the previous one's alias and position */
         st->info.alias[0] = '\0';
         st->ta_have = 0;
+        st->info.gps_valid = false;
     }
     st->info.encrypted = (bytes[2] & 0x40u) != 0; /* service options: privacy */
     dmr_voice_set_encrypted(slot_idx, st->info.encrypted);
@@ -298,6 +393,10 @@ static void apply_emb_lc(int slot_idx, const uint8_t lc[72], uint32_t t_ms)
     if (flco == FLCO_GROUP_VOICE || flco == FLCO_UNIT_VOICE)
     {
         apply_voice_lc(slot_idx, b, t_ms, "EMB");
+    }
+    else if ((fid == 0 || fid == 0x68) && flco == FLCO_GPS_INFO) /* standard, or Hytera's FID */
+    {
+        apply_gps_lc(slot_idx, lc, t_ms);
     }
     else if (fid == 0 && flco == FLCO_TA_HEADER)
     {
@@ -541,7 +640,14 @@ int dmr_proto_frame(const dmr_frame_t *f)
         if (dmr_hamming_7_4_decode(&cw))
         {
             int tc = (int)((cw >> 5) & 1u); /* TC bit (not proof of lock, see dmr_proto.h) */
-            if (tc == slot_idx)
+            if (!s_slot_phase_known)
+            {
+                /* fresh lock: no alternation history yet - the TACT sets the phase */
+                slot_idx = tc;
+                s_slot_phase_known = true;
+                s_tact_disagree = 0;
+            }
+            else if (tc == slot_idx)
             {
                 s_tact_disagree = 0;
             }
@@ -568,6 +674,9 @@ int dmr_proto_frame(const dmr_frame_t *f)
     {
         slot_idx = 0; /* MS sourced / simplex: a single channel every 60 ms */
     }
+#ifdef DMR_SLOT_TRACE
+    printf("SLOT t=%u sync=%d slot=%d known=%d\n", (unsigned)f->t_ms, (int)f->sync, slot_idx, (int)s_slot_phase_known);
+#endif
     s_last_slot = slot_idx;
     st = &s_slot[slot_idx];
 
@@ -642,4 +751,9 @@ void dmr_proto_unprove(void)
 {
     s_proven = false;
     dmr_voice_reset();
+}
+
+void dmr_proto_new_lock(void)
+{
+    s_slot_phase_known = false; /* timing restarts: slot phase must be re-learned */
 }

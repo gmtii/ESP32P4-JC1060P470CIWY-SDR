@@ -61,6 +61,12 @@ typedef struct
     uint32_t src;        /* source radio ID */
     char alias[DMR_ALIAS_MAX]; /* talker alias, "" if none */
     bool encrypted;      /* LC service options privacy bit: voice not played */
+    /* GPS Info LC (FLCO 0x08, ETSI TS 102 361-2), sent in the embedded LC of
+     * voice by some radios */
+    bool gps_valid;
+    float gps_lat, gps_lon;  /* degrees, + = N / E */
+    int gps_err_m;           /* position error bound in metres, -1 unknown */
+    char gps_grid[7];        /* Maidenhead locator of that position */
     uint32_t last_ms;    /* stream time of the last burst on this slot */
     uint32_t call_start_ms;
 } dmr_slot_info_t;
@@ -74,6 +80,9 @@ typedef struct
     bool group;
     uint32_t dst, src;
     char alias[DMR_ALIAS_MAX];
+    bool gps_valid;
+    float gps_lat, gps_lon;
+    char gps_grid[7];
     uint32_t seq; /* increments per new entry (UI change detection) */
 } dmr_log_entry_t;
 
@@ -81,7 +90,7 @@ typedef struct
 typedef struct
 {
     uint32_t frames, frames_valid;
-    uint32_t lc_headers, terminators, emb_lc_ok, emb_lc_bad, csbk, idle;
+    uint32_t lc_headers, terminators, emb_lc_ok, emb_lc_bad, csbk, idle, gps;
 } dmr_proto_stats_t;
 
 void dmr_proto_reset(void);
@@ -114,6 +123,13 @@ bool dmr_proto_is_ms_mode(void);
 /* The demodulator flipped polarity: forget that the stream was proven, so no
  * voice is decoded until a burst validates again. */
 void dmr_proto_unprove(void);
+
+/* The demodulator (re)acquired a stream: the BS slot phase must be re-learned
+ * from the next good CACH TACT instead of predicted by alternation. */
+void dmr_proto_new_lock(void);
+
+/* Maidenhead locator (6 characters + NUL) of a position in degrees. */
+void dmr_latlon_to_grid(float lat, float lon, char out[7]);
 
 /* Optional line-oriented event printer (host test / serial log). */
 typedef void (*dmr_proto_print_fn)(const char *line);

@@ -7,7 +7,8 @@
  * bs: a repeater (BS sourced) stream - TS1 idle, TS2 a group call from
  *     2140123 to TG 214 with talker alias "EA8DGL", voice LC headers, 4
  *     voice superframes (embedded LC: IDs, then talker alias header and
- *     block 1), terminators; a CSBK on TS1 at the end.
+ *     block 1, then a GPS Info LC with the Teide summit), terminators; a CSBK on
+ *     TS1 at the end.
  * ms: the same call as an MS sourced (simplex) stream, bursts every 60 ms.
  *
  * Environment:
@@ -71,8 +72,19 @@ static void cach(int slot, int on)
 }
 
 /* burst with payload halves (108 bits each) and a 48-bit centre field */
+static int g_next_slot = 0; /* BS: timeslots must strictly alternate */
+
 static void burst(int slot, const uint8_t *first, const uint8_t *centre, const uint8_t *second)
 {
+    if (!ms_mode)
+    {
+        if (slot != g_next_slot)
+        {
+            fprintf(stderr, "dmr_synth: BS slot alternation broken at symbol %d\n", nsym);
+            exit(2);
+        }
+        g_next_slot = 1 - slot;
+    }
     static const uint8_t z[288] = {0};
     if (!ms_mode) cach(slot, 1);
     else put_bits(z, 24, 0); /* MS: the 12-symbol CACH position is silent */
@@ -142,13 +154,13 @@ static void voice_superframe(int slot, int cc, const uint8_t lc72[72], int idle_
             else memset(&c[8], 0, 32);
             memcpy(&c[40], &emb[8], 8);
         }
-        burst(slot, a, c, b);
         if (!ms_mode && idle_other_slot)
         {
             uint8_t idle[96];
             for (int i = 0; i < 96; i++) idle[i] = rand() & 1;
             data_burst(1 - slot, cc, 9, idle);
         }
+        burst(slot, a, c, b);
     }
 }
 
@@ -189,8 +201,8 @@ int main(int argc, char **argv)
     }
     for (int k = 0; k < 3; k++)
     {
-        full_lc(slot, cc, 1, DMR_RS_MASK_VOICE_HEADER, dst, src);
         if (!ms_mode) { uint8_t idle[96] = {0}; data_burst(1 - slot, cc, 9, idle); }
+        full_lc(slot, cc, 1, DMR_RS_MASK_VOICE_HEADER, dst, src);
     }
     {
         uint8_t lc[72];
@@ -207,15 +219,27 @@ int main(int argc, char **argv)
 
         /* DMR_SYNTH_SF=n: a longer call (default 4 superframes) */
         int nsf = getenv("DMR_SYNTH_SF") ? atoi(getenv("DMR_SYNTH_SF")) : 4;
+        /* GPS Info LC (FLCO 0x08): Teide summit, 28.27239 N 16.64250 W, +-20 m */
+        uint8_t gps[72] = {0};
+        {
+            const double glat = 28.27239, glon = -16.64250;
+            int32_t rlon = (int32_t)lround(glon / 360.0 * 33554432.0);
+            int32_t rlat = (int32_t)lround(glat / 180.0 * 16777216.0);
+            dmr_u32_to_bits(0x08, 8, gps);                          /* FLCO 8, FID 0 */
+            dmr_u32_to_bits(1, 3, &gps[20]);                        /* position error < 20 m */
+            dmr_u32_to_bits((uint32_t)rlon & 0x1FFFFFFu, 25, &gps[23]);
+            dmr_u32_to_bits((uint32_t)rlat & 0xFFFFFFu, 24, &gps[48]);
+        }
         emb_lc_bytes(lc, grp);
         voice_superframe(slot, cc, lc, 1);
         voice_superframe(slot, cc, hdr, 1);
+        voice_superframe(slot, cc, gps, 1);
         for (int s = 2; s < nsf; s++) voice_superframe(slot, cc, lc, 1);
     }
     for (int k = 0; k < 2; k++)
     {
-        full_lc(slot, cc, 2, DMR_RS_MASK_TERMINATOR, dst, src);
         if (!ms_mode) { uint8_t idle[96] = {0}; data_burst(1 - slot, cc, 9, idle); }
+        full_lc(slot, cc, 2, DMR_RS_MASK_TERMINATOR, dst, src);
     }
     if (!ms_mode)
     {
@@ -225,7 +249,7 @@ int main(int argc, char **argv)
         crc = (uint16_t)(dmr_crc_ccitt(csbk, 80) ^ DMR_CRC_MASK_CSBK);
         dmr_u32_to_bits(crc, 16, &csbk[80]);
         data_burst(0, cc, 3, csbk);
-        for (int k = 0; k < 6; k++) { uint8_t idle[96] = {0}; data_burst(k & 1, cc, 9, idle); }
+        for (int k = 0; k < 6; k++) { uint8_t idle[96] = {0}; data_burst((k + 1) & 1, cc, 9, idle); }
     }
 
     /* ---- 4FSK: RRC-shaped deviation, FM to IQ ---- */

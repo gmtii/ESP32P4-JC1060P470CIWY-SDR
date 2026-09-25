@@ -112,4 +112,11 @@ int ft8_decoder_get_last_timing(const float **dt_s);
  * UI tell "band quiet" apart from "signals heard but nothing decodes". */
 int ft8_decoder_get_last_top_score(void);
 
+/* Own QTH (centre of the configured grid square) in degrees, false if no
+ * valid grid is set - shared with the DMR GPS display (dmr_ui.c). */
+bool ft8_decoder_get_own_latlon(float *lat, float *lon);
+
+/* Great-circle distance in km (same haversine as the FT8 distance field). */
+float ft8_distance_km(float lat1, float lon1, float lat2, float lon2);
+
 #endif /* FT8_DECODER_H */

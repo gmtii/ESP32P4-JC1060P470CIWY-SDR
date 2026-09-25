@@ -22,6 +22,36 @@ the NFM audio is muted while DMR is on.
 - **Serial log.** Every call event is also logged on the console with the tag
   `DMR`.
 
+## Position (GPS Info LC)
+
+Some radios send their position inside the embedded LC of voice. This is
+ETSI TS 102 361-2 FLCO 0x08, with the standard FID 0 or Hytera's 0x68. The
+decoder shows it on the slot card and in the call log:
+
+- the Maidenhead locator;
+- the distance to your own QTH, which is the same grid as FT8
+  (`ft8_decoder_get_own_latlon()`, set with the PC tool's MSG_SET_GRID);
+- the full position with its error bound, in the serial log.
+
+Field layout, checked against dsd-fme's decoder:
+
+| Bits | Field |
+|---|---|
+| 16-19 | reserved |
+| 20-22 | position error: 2·10^n m, 7 = unknown |
+| 23-47 | longitude, 25-bit two's complement, 360/2^25 °/LSB |
+| 48-71 | latitude, 24-bit two's complement, 180/2^24 °/LSB |
+
+The resolution is about 1-2 m. The sign is undone as exact two's complement.
+dsd-fme uses "0x800001 - value", which is one LSB off, so it shows 16.64251°
+where the transmitted value is 16.64250°.
+
+Test: `dmr_synth` embeds the Teide summit (28.27239 N 16.64250 W, less than
+20 m). Both dsd-fme and this decoder recover it; ours reads IL18qg.
+
+LRRP, Motorola's packet-data location, is not decoded yet. It needs data
+packet reassembly, including rate 3/4 trellis.
+
 ## Architecture (`main/dmr/`)
 
 ```

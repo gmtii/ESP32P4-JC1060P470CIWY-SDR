@@ -369,6 +369,7 @@ static void framer_step(void)
             s_fam = family_of(s_cand_sync);
             s_locked = true;
             s_first_frame = true;
+            dmr_proto_new_lock();
             s_bad = 0;
             s_t_exp = s_cand_t;
             s_cand = false;

@@ -11,6 +11,7 @@
 #include "dmr_proto.h"
 #include "dmr_voice.h"
 #include "ft8_time.h" /* shared UTC clock for the call log */
+#include "ft8_decoder.h" /* own QTH (grid) and distance, shared with FT8 */
 
 extern int demod_modo;
 
@@ -48,6 +49,25 @@ static dmr_ui_exit_cb_t s_exit_cb;
 void dmr_ui_set_exit_callback(dmr_ui_exit_cb_t cb)
 {
     s_exit_cb = cb;
+}
+
+/* "IL18qg 23 km" (distance only when the own grid is set) */
+static void fmt_gps(bool valid, float lat, float lon, const char *grid, char *out, size_t len)
+{
+    float mlat, mlon;
+    if (!valid)
+    {
+        out[0] = '\0';
+        return;
+    }
+    if (ft8_decoder_get_own_latlon(&mlat, &mlon))
+    {
+        snprintf(out, len, "%s %.0f km", grid, ft8_distance_km(mlat, mlon, lat, lon));
+    }
+    else
+    {
+        snprintf(out, len, "%s", grid);
+    }
 }
 
 static const char *act_name(dmr_activity_t a)
@@ -135,7 +155,16 @@ static void card_update(int idx, const dmr_demod_status_t *ds, bool ms)
         {
             lv_label_set_text_fmt(c->src, "SRC %u   (last)", (unsigned)si.src);
         }
-        lv_label_set_text(c->alias, si.alias);
+        if (si.gps_valid)
+        {
+            char g[32];
+            fmt_gps(true, si.gps_lat, si.gps_lon, si.gps_grid, g, sizeof(g));
+            lv_label_set_text_fmt(c->alias, "%s%s" LV_SYMBOL_GPS " %s", si.alias, si.alias[0] ? "   " : "", g);
+        }
+        else
+        {
+            lv_label_set_text(c->alias, si.alias);
+        }
     }
     else
     {
@@ -150,7 +179,7 @@ static void log_update(const dmr_demod_status_t *ds)
 {
     dmr_log_entry_t e[DMR_LOG_LEN];
     int n = dmr_proto_get_log(e);
-    static char buf[DMR_LOG_LEN * 72];
+    static char buf[DMR_LOG_LEN * 96];
     int pos = 0;
     const int show = 6;
 
@@ -167,9 +196,12 @@ static void log_update(const dmr_demod_status_t *ds)
     {
         char t[12];
         fmt_time(e[i].t_ms, ds->now_ms, t, sizeof(t));
-        pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, "%s  %s  %s %-8u  SRC %-8u %s%s", t,
+        char g[32];
+        fmt_gps(e[i].gps_valid, e[i].gps_lat, e[i].gps_lon, e[i].gps_grid, g, sizeof(g));
+        pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, "%s  %s  %s %-8u  SRC %-8u %s%s%s%s", t,
                         e[i].slot ? (e[i].slot == 1 ? "TS1" : "TS2") : "MS ", e[i].group ? "TG" : "ID",
-                        (unsigned)e[i].dst, (unsigned)e[i].src, e[i].alias, i > n - show && i > 0 ? "\n" : "");
+                        (unsigned)e[i].dst, (unsigned)e[i].src, e[i].alias, g[0] ? "  " : "", g,
+                        i > n - show && i > 0 ? "\n" : "");
     }
     lv_label_set_text(s_log, buf);
 }
