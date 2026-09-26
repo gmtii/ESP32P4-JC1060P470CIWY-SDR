@@ -1,216 +1,144 @@
-# ESP32-P4 SDR receiver for the JC1060P470CIWY board
+# ESP32-P4 SDR (JC1060P470CIWY + RTL-SDR)
 
-A standalone software-defined radio receiver running on an ESP32-P4 board
-(JC1060P470CIWY, 1024×600 MIPI-DSI display). It receives with an
-**RTL-SDR Blog V4** connected to the P4's USB High-Speed host port, demodulates
-on the chip, shows a spectrum/waterfall on the LVGL touch-screen UI and plays
-the audio through an external **NAU8822** codec.
-
-> **Status: experimental.** The RTL-SDR input path has been validated with
-> host-side simulations (see [`test/`](test/)). On-air results: *(update me)*.
-
-## Features
-
-- Demodulation: USB, LSB, AM, synchronous AM (SAM, SAM-L, SAM-U) and FM
-- Selectable filter bandwidth per mode, noise reduction, software AGC
-- Spectrum and waterfall display, S-meter
-- Rotary encoder + button for tuning, LVGL menus for mode, filter and gain
-- UART command interface
-- 100 % on-chip DSP (ESP-DSP): no PC required
+A standalone software-defined receiver built on the Guition JC1060P470CIWY
+board. It combines an ESP32-P4, a 7" 1024x600 touch display, 32 MB of PSRAM
+and 16 MB of flash. An RTL-SDR Blog V4, connected over USB Host, is the RF
+front end. The radio decodes FT8, DMR and AIS on its own, with no PC.
 
 ## Hardware
 
-| Part | Notes |
-|------|-------|
-| Board | ESP32-P4, JC1060P470CIWY, 1024×600 display (JD9165 controller) |
-| Receiver | RTL-SDR Blog V4 on the **USB High-Speed host** port |
-| Audio out | NAU8822 codec, I2S at 48 kHz (control over a 3-wire serial bus) |
-| Controls | Rotary encoder with push button |
+- **Board:** JC1060P470CIWY. ESP32-P4 at 360 MHz, MIPI-DSI display, GT911
+  touch, rotary encoder.
+- **RF:** RTL-SDR Blog V4 on the USB Host port, driven by `esp_rtl_sdr`. The
+  dongle runs at 960 kS/s and is decimated on the board (CIC, drift
+  resampler, FIR) to:
+  - 48 kS/s for the narrow modes;
+  - 192 kS/s for WFM and AIS.
+- **Audio:** the on-board ES8311 codec at 48 kHz. It is a **mono** codec, so
+  FM stereo is intentionally not implemented.
 
-The USB connector used for the dongle must be wired to the P4's **High-Speed**
-USB PHY and must provide 5 V on VBUS. The driver does not manage VBUS: board
-power switching, if any, is the application's job. Check your board schematic
-for the correct connector and any OTG host/device jumper. Do not use the
-UART/flash port.
+## Features
 
-## Signal path
+### Receiver
 
-```
-RTL-SDR Blog V4 ──USB HS──► esp_rtl_sdr (USB Host client, callback mode)
-        CU8 I/Q @ 960 kSps
-              │  rtl_dsp.c
-              │   CIC 5:1  ─► variable-delay cubic resampler (192 kSps) ─► 96-tap FIR 4:1
-              ▼
-        int16 I/Q @ 48 kSps ──► FIFO (rtl_source.c) ──► sdr.c
-              │                      ▲
-              │        FIFO level steers the resampler to absorb
-              │        the dongle-vs-codec clock difference
-              ▼
-   ±fs/4 shift, ÷4 decimation (12 kHz), demodulation, filters, NR, AGC,
-   ×4 interpolation ─► I2S TX ─► NAU8822 ─► speaker/headphones
-```
+- **Modes:** AM, SAM (synchronous AM, also on USB/LSB sidebands), USB, LSB,
+  NFM and WFM.
+  - WFM uses the 192 kS/s wide path and is tuned on-frequency.
+  - The narrow modes use a 12 kHz LO offset.
+- **Display:** spectrum and waterfall with 15 colour palettes (the SDR++ set
+  plus "Fire"), selectable from the menu and saved in NVS.
+- **Tuning:** drag the spectrum or turn the encoder.
+  - Changes within ±24 kHz are made by a digital NCO, so the I/Q stream
+    never stops and the display does not freeze.
+  - The dongle is retuned physically only beyond that window, and re-centred
+    once after tuning goes idle.
+- **Other:** S-meter, noise reduction (NR), selectable filters and steps.
 
-Design notes:
+### FT8 (FT8 button)
 
-- **LO offset.** The dongle's LO is tuned to `VFO − 12 kHz` (`FREQ_CONV_OFFSET`);
-  the wanted signal sits 12 kHz off centre and is brought to baseband by the
-  fs/4 shift in `sdr.c`. This also keeps the RTL's DC spike out of the passband.
-- **Clock drift.** The dongle and the codec run from different crystals. The
-  consumer measures the FIFO level once per audio block (extrapolating the time
-  since the last USB block arrived) and steers the resampler step with a
-  proportional controller. Samples are never dropped or repeated in normal
-  operation; a 100 ppm error costs a 0.01 % pitch offset.
-- **Spectrum orientation.** `sdr.c` expects the signal at −12 kHz for an LO at
-  `VFO − 12 kHz`, so `rtl_source.c` negates Q by default
-  (`RTL_SOURCE_CONJUGATE_IQ 1` in `main/include/rtl_source.h`). If USB and LSB
-  come out swapped, or a known carrier is not at the centre marker of the
-  spectrum, set it to 0.
-- **Tuning is non-blocking.** `rtl_source_set_freq()` and
-  `rtl_source_set_gain_db()` only post a request; a control task talks to the
-  dongle (latest request wins), so they are safe to call from LVGL callbacks.
+- **Decoder:** ft8_lib with a 0-1600 Hz search window, ported from the
+  DeepSDR 101 firmware.
+- **Band-referenced slot clock:** each decode is timed to about 30 ms and a
+  loop steers the local clock onto the transmissions on the air. A rough
+  time setting is enough. Press TIME, then either enter HHMMSS or tap
+  "Sync slot" at :00, :15, :30 or :45.
+- **Display:** cascade view, decode list with SNR, DT and distance to your
+  grid.
 
-## RTL-SDR driver (`esp_rtl_sdr`)
+### DMR (DMR button)
 
-USB access to the dongle is provided by
-[**esp-rtl-sdr**](https://github.com/hardcoreerik/esp-rtl-sdr) by hardcoreerik,
-a clean-room ESP-IDF USB Host client for RTL2832U-class dongles (not a librtlsdr
-port). It targets the ESP32-P4 High-Speed host, with the RTL-SDR Blog V4 as its
-primary supported device. This project was developed against v0.8.0-rc3.
+- **Metadata:** colour code, talkgroup or destination, source ID, talker
+  alias and the **GPS position** carried in the embedded LC. The position is
+  shown as a locator and a distance.
+- **Streams:** repeaters (both timeslots), hotspots and simplex.
+- **Voice (optional):** AMBE+2 decoding with mbelib. mbelib is **not
+  included**, because of patents in some countries:
+  1. run `tools/fetch_mbelib.sh`;
+  2. enable *menuconfig → SDR: DMR → DMR voice*.
+- **Slot selection:** tap a slot card to listen to that slot only; tap again
+  to return to auto.
+- **Voice robustness:** corrupted-frame concealment and a soft limiter.
 
-The driver is used in **callback delivery mode**: it hands each USB block to
-`rtl_source.c`, which converts it to 48 kSps I/Q and keeps its own FIFO.
+### AIS (AIS button)
 
-### Adding the driver to the project
+- **Reception:** both channels at once, 161.975 and 162.025 MHz. The radio
+  tunes 162.000 MHz on the WFM wide path.
+- **Radar view:** centred on your QTH, with class A, class B, base stations
+  and aids to navigation. Tap it to change the range (AUTO, 2 to 100 NM).
+- **Vessel list:** name or MMSI, class, SOG, COG, distance, bearing and age.
+- **Clock:** base-station reports set the shared UTC clock when no better
+  source is available.
 
-1. Put the driver in `components/esp_rtl_sdr` (the folder name is the component
-   name; the folder that contains the driver's `CMakeLists.txt` and `include/`
-   must sit directly under `components/`):
+### Shared clock
 
-   ```sh
-   git submodule add https://github.com/hardcoreerik/esp-rtl-sdr components/esp_rtl_sdr
-   ```
+- **Sources:** the serial PC tool (`time_sync_sdr101.py` on UART0), manual
+  entry, or an AIS base station.
+- **Used by:** the UI clock, FT8 and the DMR call log.
 
-2. Add the component to `main/CMakeLists.txt` if the build cannot find
-   `esp_rtl_sdr.h`:
+## Bottom-row buttons
 
-   ```cmake
-   idf_component_register(... PRIV_REQUIRES esp_rtl_sdr)
-   ```
+| Button | Action |
+|---|---|
+| MENU | modes, filters, NR, gains, palette |
+| MODE | cycle the demodulation mode |
+| AIS | AIS receiver on/off (restores the previous frequency and mode) |
+| STEP | tuning step |
+| FT8 | FT8 mode on/off |
+| DMR | DMR mode on/off |
 
-3. With **ESP-IDF 6.x** the USB Host stack is no longer part of IDF; add it to
-   `main/idf_component.yml`:
-
-   ```yaml
-   dependencies:
-     espressif/usb: "*"
-   ```
-
-   The driver itself declares ESP-IDF ≥ 5.5 and its author tests on 5.5.x, so
-   6.x is not covered by the driver's own testing.
-
-4. In `sdkconfig.defaults`:
-
-   ```
-   CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE=1024
-   ```
-
-   Keep the P4 chip-revision settings your board needs.
-
-### Runtime API (`main/include/rtl_source.h`)
-
-| Function | Purpose |
-|----------|---------|
-| `rtl_source_init(lo_hz, gain_db)` | Start the control task; installs the driver and streams as soon as a dongle is present. Does not block on USB. |
-| `rtl_source_set_freq(lo_hz)` | Request a new LO frequency (VFO − `FREQ_CONV_OFFSET`). |
-| `rtl_source_set_gain_db(db)` / `rtl_source_set_gain_auto(bool)` | Manual tuner gain (0–50 dB) or the tuner's AGC. |
-| `rtl_source_read_float(i, q, n, timeout_ms)` | Blocking read of `n` I/Q frames at 48 kSps, called from the SDR task. Times out if no dongle is present. |
-| `rtl_source_is_streaming()` | Dongle attached and streaming. |
-| `rtl_source_get_stats(&s)` | FIFO level, drift correction (ppm), under/overruns, driver USB counters. |
-
-Hot-plug is handled by the control task: on disconnect or fault it stops and
-resets the driver, then restarts the stream with the last requested frequency
-and gain.
-
-### Notes and limits
-
-- **8-bit ADC.** The RTL-SDR has far less dynamic range than the previous
-  16-bit codec input. Set the gain (menu slider, 0–50 dB) so strong signals do
-  not overload the receiver, especially on crowded HF bands.
-- **HF and LF.** Below 28.8 MHz the V4 receives through its built-in
-  upconverter, handled by the driver. The driver documents LF (below 500 kHz)
-  as experimental. Minimum tuning frequency for the V4 is 24 kHz of LO.
-- **S-meter.** The level scale differs from the codec input; the S-meter offset
-  in `smeter.c` needs recalibration.
-- **Retunes are USB transactions.** Each VFO change reprograms the dongle's LO
-  over USB and takes a few milliseconds. Fine tuning by shifting in software
-  inside the 960 kHz capture window (retuning only when leaving it) is a
-  possible future improvement.
-- **Task priorities.** The driver's USB task runs at priority 20 and its
-  delivery task at 18. If `usb_overruns` grows in `rtl_source_get_stats()`, lower
-  the SDR task priority below 18.
-
-### Troubleshooting
-
-| Symptom | Likely cause |
-|---------|--------------|
-| `ERR_NO_DEVICE`, no `streaming` log line | Dongle in the wrong port (must be the HS host port), no VBUS, or dongle not a supported Blog V4 |
-| `install()` returns `ESP_RTL_SDR_ERR_USB_SAFE_MODE` | The driver's fault guard latched after repeated enumeration panics. Unplug the dongle, call `esp_rtl_sdr_usb_fault_guard_reset()`, reconnect, then install again |
-| USB and LSB swapped, or carrier off the centre marker | Flip `RTL_SOURCE_CONJUGATE_IQ` |
-| `usb_overruns` > 0, `effective_sps` < 960000 | USB port not at High-Speed, or SDR task starving the driver's delivery task |
-| Periodic `underruns` | SDR task not keeping up; check DSP load and LVGL task priority |
+FT8, DMR and AIS exclude each other; each one takes over the spectrum area.
 
 ## Building
 
-Requires ESP-IDF for the ESP32-P4 target.
+Requires ESP-IDF v5.5.
 
-```sh
-idf.py set-target esp32p4
-idf.py build
-idf.py -p PORT flash monitor
-```
+1. Create a custom partition table for the 16 MB flash, in `partitions.csv`
+   at the project root:
+   ```
+   nvs,      data, nvs,     0x9000,  0x6000,
+   phy_init, data, phy,     0xf000,  0x1000,
+   factory,  app,  factory, 0x10000, 0x600000,
+   ```
+2. In menuconfig:
+   - set the flash size to 16 MB;
+   - select the custom partition table `partitions.csv`.
+3. Optional settings:
+   - *SDR: DMR → DMR voice (mbelib)* for DMR voice;
+   - *LVGL → Fonts → UNSCII 16* for a monospaced FT8 list.
+4. Build and flash with `idf.py fullclean build flash monitor`.
 
-Managed dependencies include LVGL 9.2, ESP-DSP, `esp_lvgl_port`,
-`esp_codec_dev`, the display driver and the knob/button components (see
-`main/idf_component.yml`). Some of them need explicit version constraints
-depending on the ESP-IDF release; the working set is recorded in
-`dependencies.lock`.
+## Serial console (UART0, 115200)
 
-## Tests
+| Command | Purpose |
+|---|---|
+| `utc` | show the current clock, its source and sync statistics |
+| `usbguard` | clear the `esp_rtl_sdr` USB fault guard after repeated crashes during USB enumeration, then reboot |
 
-The DSP chain and `rtl_source.c` have host-side tests that need only `gcc` (a
-fake driver and a pthread FreeRTOS shim stand in for the hardware):
+Binary time and grid frames from `time_sync_sdr101.py` are accepted on the
+same port.
 
-```sh
-ESP_RTL_SDR_DIR=components/esp_rtl_sdr ./test/run_host_tests.sh
-```
+## Host tests
 
-They cover amplitude response and alias rejection, I/Q orientation, closed-loop
-drift tracking (±100 ppm, no under/overruns, no phase discontinuities), retune,
-gain, unplug and replug.
+Plain gcc, no ESP-IDF needed:
 
-## Repository layout
+- `test/host`: FT8. WAV corpus, DT calibration and band-sync simulation.
+- `test/host_dmr`: DMR. FEC cross-checked against dsd-fme, a real repeater
+  capture, synthetic signals, and bit-exact AMBE comparison.
+- `test/host_ais`: AIS. Synthesizer validated with AIS-catcher, plus a
+  sensitivity sweep.
+- `test/host_rtl`: the NCO and the tuning-logic model.
 
-```
-main/
-  main.c, sdr.c            application entry, SDR task (demodulation chain)
-  rtl_source.c/.h          esp_rtl_sdr glue: control task, FIFO, drift loop
-  rtl_dsp.c/.h             CU8 → 48 kSps I/Q conversion (pure C, host-testable)
-  ui.c, menu.c, smeter.c   LVGL interface
-  nau8822.c, i2s_driver.c  audio output codec
-  uart_commands.c          UART command interface
-components/esp_rtl_sdr/    RTL-SDR USB driver (git submodule)
-test/                      host-side tests
-```
+## Documentation
+
+- `README_FT8.md`: FT8 port, band-sync loop, calibration.
+- `README_DMR.md`: DMR demodulator, protocol, voice, GPS, verification.
+- `README_AIS.md`: AIS receiver, design notes, results.
+- `THIRD_PARTY_NOTICES.md`: licences for ft8_lib (MIT), the SDR++
+  colormaps (GPL-3.0), DSD AMBE tables and mbelib (ISC), and the test
+  references.
 
 ## Licence
 
-Project licence: *(add yours)*.
-
-`esp_rtl_sdr` is licensed **AGPL-3.0-only**. Firmware that links it is a
-combined work: check the AGPL's terms before distributing binaries or hosting
-the firmware as a service.
-
-## Credits
-
-- [esp-rtl-sdr](https://github.com/hardcoreerik/esp-rtl-sdr) by hardcoreerik: the RTL2832U USB Host driver
-- [ESP-DSP](https://github.com/espressif/esp-dsp), [LVGL](https://lvgl.io/) and the Espressif component ecosystem
+This project includes GPL-3.0 material (the SDR++ colormaps), so the
+combined work is distributed under GPL-3.0-compatible terms. See
+`THIRD_PARTY_NOTICES.md`.
