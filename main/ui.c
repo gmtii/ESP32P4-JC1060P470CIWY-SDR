@@ -26,8 +26,6 @@
 /* Uncomment to log how long the FFT, spectrum and waterfall steps take (every 2 s) */
 // #define UI_PERF_LOG
 
-#include "images/smeter2.c"
-
 #include "menu.h"
 
 #include "ft8_app.h"
@@ -36,6 +34,8 @@
 #include "palettes.h"
 #include "dmr_app.h"
 #include "dmr_ui.h"
+#include "ais_app.h"
+#include "ais_ui.h"
 #include "nvs_flash.h"
 #include "nvs.h"
 
@@ -217,9 +217,9 @@ void timer_dibuja_pantalla(lv_timer_t *timer)
       /* While the FT8 panel covers the spectrum/waterfall, calcula_fft()
        * above keeps running (the S-meter depends on it) but the hidden
        * redraws are skipped. */
-      if (ft8_ui_is_visible() || dmr_ui_is_visible())
+      if (ft8_ui_is_visible() || dmr_ui_is_visible() || ais_ui_is_visible())
       {
-        covered_by_ft8 = true; /* FT8 or DMR panel */
+        covered_by_ft8 = true; /* FT8, DMR or AIS panel */
         lvgl_port_unlock();
         return;
       }
@@ -447,6 +447,15 @@ static lv_obj_t *label_ft8;
 static lv_obj_t *btn_dmr;   /* DMR button (see dmr_mode_toggle() below) - declared */
 static lv_obj_t *label_dmr; /* here because entering FT8 also has to switch DMR off */
 
+/* The bottom-row FILTER button now toggles AIS (filters stay in the menu). */
+static void ais_button_refresh(void)
+{
+  if (label_filtros != NULL)
+  {
+    lv_label_set_text(label_filtros, ais_app_is_active() ? "ON" : "OFF");
+  }
+}
+
 /* Standard FT8 dial frequencies (USB) and the band each one belongs to. On
  * entering FT8 the VFO snaps to the FT8 frequency of the band it is in; if it
  * is outside every amateur band listed here, it goes to 20 m. */
@@ -523,6 +532,12 @@ static void ft8_mode_toggle(void)
         lv_label_set_text(label_dmr, "OFF");
       }
     }
+    if (ais_app_is_active())
+    {
+      ais_app_set_active(false);
+      ais_ui_show(false);
+      ais_button_refresh();
+    }
     demod_modo = DEMOD_USB;
     currentVFO.demod_modo = DEMOD_USB;
     currentVFO.Frec = ft8_dial_for(currentVFO.Frec);
@@ -535,7 +550,7 @@ static void ft8_mode_toggle(void)
     }
     rtl_source_set_freq(currentVFO.Frec - lo_offset_for_mode(demod_modo));
 
-    lv_label_set_text_fmt(label_modos, "%s", demod_modos_texto[demod_modo]);
+    lv_label_set_text_fmt(label_modos, "FT8 %s", demod_modos_texto[demod_modo]);
     dibuja_pasabanda();
     refresca_indicadores();
 
@@ -583,6 +598,12 @@ static void dmr_mode_toggle(void)
     {
       ft8_mode_toggle(); /* leave FT8 first */
     }
+    if (ais_app_is_active())
+    {
+      ais_app_set_active(false); /* leave AIS (its panel hides itself) */
+      ais_ui_show(false);
+      ais_button_refresh();
+    }
     demod_modo = DEMOD_FM;
     currentVFO.demod_modo = DEMOD_FM;
     if (was_wfm)
@@ -591,7 +612,7 @@ static void dmr_mode_toggle(void)
       rtl_source_set_gain_db(menu_get_rtl_gain_db());
     }
     rtl_source_set_freq(currentVFO.Frec - lo_offset_for_mode(demod_modo));
-    lv_label_set_text_fmt(label_modos, "%s", demod_modos_texto[demod_modo]);
+    lv_label_set_text_fmt(label_modos, "DMR %s", demod_modos_texto[demod_modo]);
     dibuja_pasabanda();
     refresca_indicadores();
 
@@ -599,6 +620,95 @@ static void dmr_mode_toggle(void)
     dmr_ui_show(true);
   }
   dmr_button_refresh();
+}
+
+/* ---------------------------------------------------------------------------
+ * AIS mode (menu -> AIS). Tunes 162.000 MHz on the WFM wide path (both AIS
+ * channels at +-25 kHz); leaving restores the previous frequency and mode.
+ * FT8, DMR and AIS exclude each other (all take over the spectrum area).
+ * ------------------------------------------------------------------------- */
+#define AIS_CENTER_HZ 162000000u
+static uint32_t s_ais_prev_freq;
+static int s_ais_prev_mode = -1;
+static void (*s_ais_state_cb)(void);
+
+void ui_ais_set_state_callback(void (*cb)(void))
+{
+  s_ais_state_cb = cb;
+}
+
+static void ais_apply_tuning(uint32_t f, int mode)
+{
+  const bool was_wfm = (demod_modo == DEMOD_WFM);
+  demod_modo = mode;
+  currentVFO.demod_modo = mode;
+  currentVFO.Frec = f;
+  update_vfo_label();
+  if (was_wfm && mode != DEMOD_WFM)
+  {
+    rtl_source_set_gain_auto(false);
+    rtl_source_set_gain_db(menu_get_rtl_gain_db());
+  }
+  rtl_source_set_freq(currentVFO.Frec - lo_offset_for_mode(demod_modo));
+  lv_label_set_text_fmt(label_modos, "AIS %s", demod_modos_texto[demod_modo]);
+  dibuja_pasabanda();
+  refresca_indicadores();
+}
+
+static void ais_exit_cb(void)
+{
+  /* the panel left AIS on its own (mode changed elsewhere): keep that mode */
+  s_ais_prev_mode = -1;
+  ais_button_refresh();
+  if (s_ais_state_cb != NULL)
+  {
+    s_ais_state_cb();
+  }
+}
+
+void ui_ais_toggle(void)
+{
+  if (!ais_app_available())
+  {
+    ESP_LOGW(TAG, "AIS not available (init failed, see log)");
+    return;
+  }
+  if (ais_app_is_active())
+  {
+    ais_app_set_active(false);
+    ais_ui_show(false);
+    if (s_ais_prev_mode >= 0)
+    {
+      ais_apply_tuning(s_ais_prev_freq, s_ais_prev_mode);
+      s_ais_prev_mode = -1;
+    }
+  }
+  else
+  {
+    if (ft8_app_is_active())
+    {
+      ft8_mode_toggle();
+    }
+    if (dmr_app_is_active())
+    {
+      dmr_mode_toggle();
+    }
+    s_ais_prev_freq = currentVFO.Frec;
+    s_ais_prev_mode = demod_modo;
+    ais_apply_tuning(AIS_CENTER_HZ, DEMOD_WFM);
+    ais_app_set_active(true);
+    ais_ui_show(true);
+  }
+  ais_button_refresh();
+  if (s_ais_state_cb != NULL)
+  {
+    s_ais_state_cb();
+  }
+}
+
+bool ui_ais_is_active(void)
+{
+  return ais_app_is_active();
 }
 
 void btn_event_cb(lv_event_t *e)
@@ -644,16 +754,7 @@ void btn_event_cb(lv_event_t *e)
     }
     else if (obj == btn_filtros)
     {
-
-      filtro_indice++;
-      if (filtro_indice > 4)
-        filtro_indice = 0;
-      f_actualiza = true;
-
-      dibuja_pasabanda();
-      refresca_indicadores();
-
-      lv_label_set_text_fmt(label_filtros, "%s", filtros_texto[filtro_indice]);
+      ui_ais_toggle(); /* FILTER button repurposed as AIS; filters: menu -> FILTRO */
     }
     else if (obj == btn2)
     {
@@ -812,21 +913,21 @@ void dibuja_botones(void)
   add_name_value_labels(btn_modos, "MODE", &label_modos);
   lv_label_set_text_fmt(label_modos, "%s", demod_modos_texto[demod_modo]);
 
-  /* --- Botón Filtros: "FILTER" / current filter width --- */
-  btn_filtros = lv_btn_create(screen);
-  style_ctrl_button(btn_filtros);
-  lv_obj_align(btn_filtros, LV_ALIGN_BOTTOM_LEFT, 10 + 2 * (UI_CTRL_BTN_W + UI_CTRL_BTN_GAP), -10);
-
-  add_name_value_labels(btn_filtros, "FILTER", &label_filtros);
-  lv_label_set_text_fmt(label_filtros, "%s", filtros_texto[filtro_indice]);
-
   /* --- Botón Step: "STEP" / current step value --- */
   btn_step = lv_btn_create(screen);
   style_ctrl_button(btn_step);
-  lv_obj_align(btn_step, LV_ALIGN_BOTTOM_LEFT, 10 + 3 * (UI_CTRL_BTN_W + UI_CTRL_BTN_GAP), -10);
+  lv_obj_align(btn_step, LV_ALIGN_BOTTOM_LEFT, 10 + 2 * (UI_CTRL_BTN_W + UI_CTRL_BTN_GAP), -10);
 
   add_name_value_labels(btn_step, "STEP", &label_step);
   lv_label_set_text_fmt(label_step, "%d", pasos[pasos_indice]);
+
+  /* --- Botón AIS (antes FILTER): "AIS" / ON|OFF - filters stay in the menu --- */
+  btn_filtros = lv_btn_create(screen);
+  style_ctrl_button(btn_filtros);
+  lv_obj_align(btn_filtros, LV_ALIGN_BOTTOM_LEFT, 10 + 3 * (UI_CTRL_BTN_W + UI_CTRL_BTN_GAP), -10);
+
+  add_name_value_labels(btn_filtros, "AIS", &label_filtros);
+  lv_label_set_text(label_filtros, "OFF");
 
   /* --- Botón FT8: "FT8" / ON|OFF --- */
   btn_ft8 = lv_btn_create(screen);
@@ -1331,6 +1432,8 @@ void init_ui()
   ft8_ui_set_exit_callback(ft8_exit_cb);
   dmr_ui_create(screen, UI_SPECTRUM_TOP_Y);
   dmr_ui_set_exit_callback(dmr_exit_cb);
+  ais_ui_create(screen, UI_SPECTRUM_TOP_Y);
+  ais_ui_set_exit_callback(ais_exit_cb);
 }
 
 void smeter_set_dbm(float dbm)

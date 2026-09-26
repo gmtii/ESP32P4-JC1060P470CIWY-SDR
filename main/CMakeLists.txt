@@ -35,7 +35,11 @@ idf_component_register(
     dmr/dmr_proto.c
     dmr/dmr_fec.c
     dmr/dmr_voice.c
-    INCLUDE_DIRS .  ${INCLUDE_DIR} ft8 dmr
+    ais/ais_app.c
+    ais/ais_ui.c
+    ais/ais_demod.c
+    ais/ais_msg.c
+    INCLUDE_DIRS .  ${INCLUDE_DIR} ft8 dmr ais
     ) 
 
 idf_component_get_property(LVGL_LIB lvgl__lvgl COMPONENT_LIB)

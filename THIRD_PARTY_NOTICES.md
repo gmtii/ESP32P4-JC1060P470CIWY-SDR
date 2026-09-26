@@ -54,7 +54,7 @@ projects.
   by patents in some jurisdictions; check that using it is lawful where you
   are before enabling it.
 
-## DMR test references (not part of the firmware)
+## Test references (not part of the firmware)
 
 The files in `test/host_dmr/` use these projects only as independent
 references. No code from them is included in the firmware.
@@ -63,6 +63,10 @@ references. No code from them is included in the firmware.
   - Its generator matrices are dumped into `test/host_dmr/fme_ref_matrices.h`
     for cross-checking only.
   - The optional test step runs its binary on our synthetic signals.
+- **AIS-catcher** (jvde-github, GPL-3.0), https://github.com/jvde-github/AIS-catcher
+  - Used to validate `test/host_ais/ais_synth.c` by decoding our synthetic
+    AIS signals, and as a sensitivity baseline.
+  - No code from it is included in the firmware.
 - **DSDcc** (Edouard Griffiths F4EXB, GPL-3.0), https://github.com/f4exb/dsdcc
   - The real DMR capture `samples/dmr_it_8.dis` is used as a test input.
   - It is not redistributed here; fetch it from the DSDcc repository.

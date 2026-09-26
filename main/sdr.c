@@ -20,6 +20,7 @@
 #include "rtl_dsp.h"
 #include "ft8_app.h"
 #include "dmr_app.h"
+#include "ais_app.h"
 
 /* Uncomment to log the spectrum AGC's actual frame dB range once a second - see
  * sdr_priv.h's SPEC_AGC_DB_FLOOR/CEIL comment for why this is worth running on real
@@ -109,13 +110,36 @@ float IRAM_ATTR alpha_beta_mag(float inphase, float quadrature)
     }
 }
 
+/*
+ * FFT table readiness. calcula_fft() is called from an LVGL timer (the
+ * spectrum/waterfall redraw), which starts as soon as init_ui() releases the
+ * display - possibly BEFORE sdrTask has run its own dsps_fft2r_init_fc32().
+ * With the FT8/DMR/AIS panels init_ui() takes long enough for the timer to
+ * win that race, and the FFT then ran with a NULL twiddle table (load access
+ * fault in dsps_fft2r_fc32_arp4). app_main() now calls sdr_fft_init() before
+ * init_ui(), and calcula_fft() does nothing until the table exists.
+ */
+static volatile bool s_fft_ready = false;
+
+esp_err_t sdr_fft_init(void)
+{
+    /* esp-dsp keeps one global table and returns early if it already exists,
+     * so the later call in sdrTask (and NR_SS_init's) are harmless */
+    esp_err_t err = dsps_fft2r_init_fc32(NULL, SAMPLE_BUFFER_SIZE);
+    if (err == ESP_OK)
+    {
+        s_fft_ready = true;
+    }
+    return err;
+}
+
 void IRAM_ATTR sdrTask(void *args)
 {
 
     esp_err_t ret = ESP_OK;
 
     sam_variables_init();
-    dsps_fft2r_init_fc32(NULL, SAMPLE_BUFFER_SIZE);
+    sdr_fft_init(); /* normally already done by app_main(); harmless if so */
     NR_SS_init();
 
     // Filtro biquad LPF 48000 x 0.15 para modos AM
@@ -264,6 +288,15 @@ void IRAM_ATTR sdrTask(void *args)
             }
 
             dsps_fird_f32_ansi(&fird_wfm, wfm_discrim, demod_out, SAMPLE_BUFFER_SIZE);
+
+            /* AIS mode (tuned to 162.000 MHz on this wide path): hand the raw
+             * 192 kSps I/Q to the AIS task (copy only, see ais/ais_app.c) and
+             * mute the broadcast-FM audio, which would only be hiss here. */
+            if (ais_app_is_active())
+            {
+                ais_app_feed_iq(i_sample_wide, q_sample_wide, WFM_BUFFER_SIZE);
+                memset(demod_out, 0, SAMPLE_BUFFER_SIZE * sizeof(float));
+            }
 
             for (i = 0; i < SAMPLE_BUFFER_SIZE; i++) // convierte a int16
             {
@@ -499,6 +532,10 @@ void shift_right_circular(int16_t *v, size_t size, int offset)
 
 void IRAM_ATTR calcula_fft(void)
 {
+    if (!s_fft_ready)
+    {
+        return; /* twiddle table not built yet - see sdr_fft_init() */
+    }
     int N = SAMPLE_BUFFER_SIZE;
 
     // save old pixels for lowpass filter

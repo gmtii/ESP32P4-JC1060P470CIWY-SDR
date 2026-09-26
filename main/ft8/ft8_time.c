@@ -69,6 +69,8 @@ const char *ft8_time_source_name(ft8_time_src_t src)
         return "serial";
     case FT8_TIME_SRC_NTP:
         return "NTP";
+    case FT8_TIME_SRC_AIS:
+        return "AIS";
     default:
         return "no sync";
     }

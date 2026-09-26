@@ -9,6 +9,7 @@ extern "C"
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdlib.h>
+#include "esp_err.h"
 
 #define SAMPLE_BUFFER_SIZE (1024)
 
@@ -91,6 +92,10 @@ extern bool f_actualiza;
 
 void sdrTask(void *args);
 void calcula_fft(void);
+
+/* Builds the esp-dsp FFT table. Call from app_main() BEFORE init_ui(): the
+ * spectrum timer may run calcula_fft() before sdrTask starts. */
+esp_err_t sdr_fft_init(void);
 
 #ifdef __cplusplus
 }

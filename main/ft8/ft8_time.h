@@ -35,6 +35,7 @@ typedef enum
     FT8_TIME_SRC_MANUAL,
     FT8_TIME_SRC_SERIAL,
     FT8_TIME_SRC_NTP, /* reserved for the ESP32-C6 / SNTP integration */
+    FT8_TIME_SRC_AIS, /* AIS base station report (message 4), second resolution */
 } ft8_time_src_t;
 
 /* UTC milliseconds since 1970-01-01. */

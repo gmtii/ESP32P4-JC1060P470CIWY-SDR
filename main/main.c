@@ -28,6 +28,7 @@
 #include "uart_commands.h"
 #include "ft8_app.h"
 #include "dmr_app.h"
+#include "ais_app.h"
 
 #include "pins_config.h"
 
@@ -45,8 +46,11 @@ const char *demod_modos_texto[8] = {
     "SAM ",
     "S-L ",
     "S-U ",
-    "FM  ", // 6
-    "WFM " // 7
+    "FM  ", 
+    "WFM ",
+    "FT8",
+    "DMR",
+    "AIS"   //10
 };
 
 const char *pasos_texto[7] = {
@@ -255,7 +259,17 @@ void app_main(void)
     /* DMR receive mode, phase 1 (metadata). Same contract as FT8 above. */
     dmr_app_init();
 
+    /* AIS receive mode (menu -> AIS). Same contract as FT8 / DMR above. */
+    ais_app_init();
+
     bsp_i2c_init();
+
+    /* FFT table before the UI: the spectrum timer created by init_ui() can
+     * fire before sdrTask exists (see sdr_fft_init() in sdr.c). */
+    if (sdr_fft_init() != ESP_OK)
+    {
+        ESP_LOGE("MAIN", "FFT table init failed");
+    }
 
     bsp_display_lock(0);
 

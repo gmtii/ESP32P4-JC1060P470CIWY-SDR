@@ -27,6 +27,8 @@ static const char *TAG = "DMR";
 #define DMR_TASK_CORE tskNO_AFFINITY
 
 static StreamBufferHandle_t s_sb;
+/* Work buffers in PSRAM (allocated in dmr_app_init), not static internal RAM */
+static float *s_buf, *s_bi, *s_bq, *s_tmp, *s_up_out;
 
 /* ---- Voice audio path (phase 2) -------------------------------------------
  * dmr_voice (DMR task) -> 8 kHz -> x6 polyphase interpolator -> 48 kHz float
@@ -65,9 +67,10 @@ static void up_design(void)
 }
 
 /* dmr_voice sink (DMR task): 8 kHz in, 48 kHz out to the audio stream. */
+#define UP_OUT_LEN (160 * AUD_RATE_UP)
 static void voice_sink(const float *pcm, int n)
 {
-    static float out[160 * AUD_RATE_UP];
+    float *const out = s_up_out; /* UP_OUT_LEN, PSRAM */
     const int per_phase = AUD_TAPS / AUD_RATE_UP;
     int o = 0;
 
@@ -87,11 +90,11 @@ static void voice_sink(const float *pcm, int n)
             }
             out[o++] = acc;
         }
-        if (o == (int)(sizeof(out) / sizeof(out[0])))
+        if (o == UP_OUT_LEN)
         {
-            if (xStreamBufferSpacesAvailable(s_aud) >= sizeof(out))
+            if (xStreamBufferSpacesAvailable(s_aud) >= UP_OUT_LEN * sizeof(float))
             {
-                (void)xStreamBufferSend(s_aud, out, sizeof(out), 0);
+                (void)xStreamBufferSend(s_aud, out, UP_OUT_LEN * sizeof(float), 0);
             }
             o = 0;
         }
@@ -110,14 +113,14 @@ static void log_line(const char *line)
 static void dmr_task(void *arg)
 {
     (void)arg;
-    static float buf[2 * DMR_CHUNK];
-    static float bi[DMR_CHUNK], bq[DMR_CHUNK];
+    float *const buf = s_buf, *const bi = s_bi, *const bq = s_bq;
+    const size_t buf_bytes = 2 * DMR_CHUNK * sizeof(float);
     bool was_active = false;
     int64_t next_stats = 0;
 
     for (;;)
     {
-        size_t got = xStreamBufferReceive(s_sb, buf, sizeof(buf), pdMS_TO_TICKS(50));
+        size_t got = xStreamBufferReceive(s_sb, buf, buf_bytes, pdMS_TO_TICKS(50));
         bool active = s_active;
 
         if (!active)
@@ -129,7 +132,7 @@ static void dmr_task(void *arg)
         {
             /* mode entry: drop stale IQ, start from a clean demodulator */
             was_active = true;
-            while (xStreamBufferReceive(s_sb, buf, sizeof(buf), 0) > 0)
+            while (xStreamBufferReceive(s_sb, buf, buf_bytes, 0) > 0)
             {
             }
             got = 0;
@@ -166,7 +169,12 @@ bool dmr_app_init(void)
     {
         return true;
     }
-    if (!dmr_demod_init())
+    s_buf = heap_caps_malloc(2 * DMR_CHUNK * sizeof(float), MALLOC_CAP_SPIRAM);
+    s_bi = heap_caps_malloc(DMR_CHUNK * sizeof(float), MALLOC_CAP_SPIRAM);
+    s_bq = heap_caps_malloc(DMR_CHUNK * sizeof(float), MALLOC_CAP_SPIRAM);
+    s_tmp = heap_caps_malloc(2 * DMR_CHUNK * sizeof(float), MALLOC_CAP_SPIRAM);
+    s_up_out = heap_caps_malloc(UP_OUT_LEN * sizeof(float), MALLOC_CAP_SPIRAM);
+    if (!s_buf || !s_bi || !s_bq || !s_tmp || !s_up_out || !dmr_demod_init())
     {
         ESP_LOGE(TAG, "buffer allocation failed, DMR disabled");
         return false;
@@ -218,7 +226,7 @@ bool dmr_app_is_active(void)
 
 void dmr_app_feed_iq(const float *i, const float *q, size_t n)
 {
-    static float tmp[2 * DMR_CHUNK]; /* only ever called from sdrTask */
+    float *const tmp = s_tmp; /* only ever used from sdrTask */
 
     if (!s_active || s_sb == NULL)
     {

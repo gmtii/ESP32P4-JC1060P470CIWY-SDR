@@ -315,6 +315,25 @@ static void palette_btn_label(void)
     }
 }
 
+/* AIS: enter/leave the AIS receiver (ui.c: 162.000 MHz, WFM wide path). */
+static lv_obj_t *btn14_ais = NULL;
+
+static void ais_btn_label(void)
+{
+    lv_obj_t *lbl = (btn14_ais != NULL) ? lv_obj_get_child(btn14_ais, 0) : NULL;
+    if (lbl != NULL)
+    {
+        lv_label_set_text(lbl, ui_ais_is_active() ? "AIS\nON" : "AIS\nOFF");
+    }
+}
+
+static void btn14_cb(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED)
+        return;
+    ui_ais_toggle();
+}
+
 static void btn13_cb(lv_event_t *e)
 {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED)
@@ -344,6 +363,8 @@ static void btn12_cb(lv_event_t *e)
         row_sliders = NULL;
         grid_btns = NULL;
         btn13_palette = NULL;
+        btn14_ais = NULL;
+        ui_ais_set_state_callback(NULL);
 
         box_s1 = sl_s1 = NULL;
         box_s2 = sl_s2 = NULL;
@@ -517,6 +538,10 @@ void ui_create_control_panel(void)
     lv_obj_set_width(btn13_palette, 180); /* room for "Temper Colors" */
     lv_obj_set_style_text_align(lv_obj_get_child(btn13_palette, 0), LV_TEXT_ALIGN_CENTER, 0);
     palette_btn_label();
+    btn14_ais = create_button(grid_btns, "AIS", btn14_cb);
+    lv_obj_set_style_text_align(lv_obj_get_child(btn14_ais, 0), LV_TEXT_ALIGN_CENTER, 0);
+    ais_btn_label();
+    ui_ais_set_state_callback(ais_btn_label);
 }
 
 /* ------------------------------------------------------------------------------- */
@@ -587,9 +612,9 @@ static void freq_btnm_event_cb(lv_event_t *e)
 
     if (strcmp(txt, LV_SYMBOL_OK) == 0)
     {
-        // uint32_t hz = parse_freq(lv_textarea_get_text(ta_freq), 1e6);
-        // if (hz)
-        //     currentVFO.Frec = hz;
+        //uint32_t hz = parse_freq(lv_textarea_get_text(ta_freq), 1e6);
+        //if (hz)
+        //    currentVFO.Frec = hz;
         refresca_VFO();
         rtl_source_set_freq(currentVFO.Frec - lo_offset_for_mode(demod_modo));
         freq_popup_close();

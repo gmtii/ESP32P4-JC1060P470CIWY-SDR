@@ -9,6 +9,7 @@
 
 #include "time_sync.h"
 #include "ft8_time.h"
+#include "esp_rtl_sdr.h"
 
 #define UART_NUM UART_NUM_0
 #define BUF_SIZE 1024
@@ -37,6 +38,15 @@ void uart_command_handler(char *cmd) {
     }
     else if (strcmp(cmd, "-") == 0) {
         ESP_LOGI(TAG, "Comando recibido: apagar LED");
+    }
+    else if (strcmp(cmd, "usbguard") == 0) {
+        /* The esp_rtl_sdr driver latches a "USB fault guard" after three
+         * consecutive panics during USB enumeration and then refuses to
+         * install. Panics elsewhere that merely happen during enumeration
+         * (e.g. the early-boot FFT race fixed in sdr_fft_init()) trip it too.
+         * This clears it; reboot afterwards. */
+        esp_rtl_sdr_usb_fault_guard_reset();
+        ESP_LOGI(TAG, "USB fault guard cleared - reboot now (press the reset button)");
     }
     else if (strcmp(cmd, "utc") == 0) {
         /* Quick check of the clock FT8 schedules from (see ft8/ft8_time.h) */
