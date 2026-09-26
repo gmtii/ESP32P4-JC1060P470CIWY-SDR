@@ -34,7 +34,8 @@ extern "C" {
 
 typedef struct {
     bool     streaming;        /* dongle attached and bulk stream running            */
-    uint32_t fifo_frames;      /* frames waiting for the SDR task                    */
+    bool     wide;             /* true: fifo_frames and step_ppm are in wide (192 kSps) units */
+    uint32_t fifo_frames;      /* frames waiting for the SDR task (rate per `wide`)  */
     float    step_ppm;         /* clock-drift correction currently applied           */
     uint32_t fifo_overruns;    /* frames dropped because the FIFO was full           */
     uint32_t underruns;        /* SDR task waited for data and timed out             */
@@ -47,7 +48,15 @@ typedef struct {
 /* initial_lo_hz: LO frequency (VFO - 12 kHz). initial_gain_db: manual tuner gain. */
 esp_err_t rtl_source_init(uint32_t initial_lo_hz, int initial_gain_db);
 
-/* Request a new LO frequency; the latest request wins. */
+/*
+ * Request a new LO frequency; the latest request wins. Cheap and non-blocking.
+ * Within RTL_SOURCE_DIGITAL_WINDOW_HZ (24 kHz) of the dongle's physical LO the
+ * change is made by an NCO in rtl_dsp.c: instant, the USB I/Q stream never
+ * stops (dragging the spectrum or spinning the encoder no longer freezes the
+ * display). Beyond it, or in WFM mode, the dongle is retuned physically, which
+ * briefly pauses the stream. After tuning has been idle for
+ * RTL_SOURCE_RECENTRE_MS the dongle is re-centred once and the offset dropped.
+ */
 void rtl_source_set_freq(uint32_t lo_hz);
 
 /* Manual tuner gain (0..49 dB, nearest step) or the tuner's own AGC. */
@@ -60,6 +69,18 @@ void rtl_source_set_gain_auto(bool enable);
  * ESP_ERR_TIMEOUT: no dongle, or it stalled. The caller should output silence.
  */
 esp_err_t rtl_source_read_float(float *i, float *q, size_t frames, uint32_t timeout_ms);
+
+/*
+ * Switch between the narrow (48 kSps, default) and wide (192 kSps, for WFM) I/Q
+ * rate. A no-op if the stream is already in the requested mode. Otherwise this
+ * restarts the USB stream (a fresh ring, re-primed at the new rate) rather than
+ * changing the rate under a FIFO that may still hold frames at the old rate's
+ * duration - mode changes are a deliberate, infrequent user action (switching
+ * demod mode), so the ~1 s restart this costs is a fair trade for never mixing
+ * two frame durations in the same drift-control calculation. Safe to call every
+ * loop iteration: only an actual change triggers a restart.
+ */
+void rtl_source_set_wide(bool wide);
 
 bool rtl_source_is_streaming(void);
 void rtl_source_get_stats(rtl_source_stats_t *out);

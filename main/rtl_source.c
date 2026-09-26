@@ -29,16 +29,45 @@
 
 static const char *TAG = "rtl_source";
 
-#define RING_FRAMES       8192u                     /* power of two, ~170 ms          */
+/* Uncomment to log how long each retune actually blocks (pause bulk + drain + EP0 +
+ * resubmit) - see ui.c's SPECTRUM_DRAG_RETUNE_MIN_US comment for why. */
+// #define RTL_SOURCE_RETUNE_LOG
+
+/*
+ * Sized for the worst case (wide/WFM mode, 192 kSps): RING_FRAMES gives the same
+ * ~170 ms of headroom wide mode had at 48 kSps (8192 frames there), scaled by the
+ * RTL_DSP_WIDE_RATE/RTL_DSP_OUT_RATE ratio (4x). Narrow mode gets proportionally
+ * more headroom in wide mode's frame units, which is harmless. OUT_CHUNK_FRAMES
+ * covers RTL_DSP_WIDE_MAX_FRAMES(CHUNK_BYTES) (~421 with today's sizes), well
+ * above narrow mode's ~108.
+ */
+#define RING_FRAMES       32768u                    /* power of two, ~170 ms at wide rate */
 #define RING_MASK         (RING_FRAMES - 1u)
-#define HIGH_WATER_FRAMES 6144u                     /* above this the consumer skips  */
 #define CHUNK_BYTES       4096u                     /* DSP works in chunks of this size */
-#define OUT_CHUNK_FRAMES  128u                      /* >= RTL_DSP_MAX_FRAMES(CHUNK_BYTES) */
+#define OUT_CHUNK_FRAMES  512u                      /* >= RTL_DSP_WIDE_MAX_FRAMES(CHUNK_BYTES) */
 
 /* Retry delays after a failed start. Running out of memory cannot fix itself, and every
  * retry makes the driver replay its whole demodulator init table on an already
  * configured dongle (EP0 STALLs), so wait much longer than for a missing device. */
 #ifndef RTL_SOURCE_RETRY_MS
+/*
+ * Digital tuning window: frequency changes within +-this of the hardware LO are
+ * done by the NCO in rtl_dsp (instant, the USB stream never stops). Only a
+ * change beyond it - or any change in WFM, which uses the full 192 kSps band -
+ * retunes the dongle physically, which pauses, drains and resubmits the bulk
+ * pipeline (that pause is what froze the spectrum and waterfall while dragging).
+ * +-24 kHz keeps the CIC droop under ~2 dB at the channel edge.
+ */
+#define RTL_SOURCE_DIGITAL_WINDOW_HZ 24000
+/*
+ * Once tuning has been idle this long with a digital offset in place, retune
+ * the dongle to the wanted frequency once and drop the offset: that restores
+ * the full CIC alias rejection (about -67 dB instead of ~-40 dB for signals
+ * ~140 kHz away at the window edge). One short stream pause, only after you
+ * stop tuning. 0 disables it.
+ */
+#define RTL_SOURCE_RECENTRE_MS 1500u
+
 #define RTL_SOURCE_RETRY_MS       500u
 #endif
 #ifndef RTL_SOURCE_NOMEM_RETRY_MS
@@ -71,6 +100,20 @@ static struct {
     uint32_t arr_t_us32;
     volatile bool primed;
 
+    /*
+     * Narrow (48 kSps, default) vs wide (192 kSps, WFM) tap. `wide`/`rate_mult`/
+     * `target_raw`/`high_water_raw` are owned by the delivery task (process_block()
+     * applies a pending switch there - see rtl_source_set_wide()); `want_wide` and
+     * `wide_pending` are the reader's request, mirroring how `step_req` and the
+     * lo/gain `*_pending` flags already cross the same two tasks.
+     */
+    bool wide;
+    uint32_t rate_mult;                             /* RTL_DSP_WIDE_RATE/RTL_DSP_OUT_RATE when wide, else 1 */
+    uint32_t target_raw;                            /* RTL_RATE_TARGET_FRAMES, in the active rate's raw frames */
+    uint32_t high_water_raw;                        /* likewise, the skip-ahead threshold */
+    volatile bool want_wide;
+    volatile bool wide_pending;
+
     volatile TaskHandle_t reader;
     volatile TaskHandle_t ctl;
 
@@ -80,6 +123,13 @@ static struct {
 
     volatile uint32_t want_lo_hz;
     volatile bool     lo_pending;
+    /* Digital fine tuning (see rtl_source_set_freq()): hw_lo_hz is where the
+     * dongle is physically tuned; dig_offset_hz = want - hw is applied by the
+     * NCO in rtl_dsp from the delivery callback, without touching the stream. */
+    volatile uint32_t hw_lo_hz;
+    volatile bool     hw_valid;
+    volatile int32_t  dig_offset_hz;
+    volatile int64_t  last_tune_us;                 /* time of the last rtl_source_set_freq() */
     volatile int      want_gain_db;
     volatile bool     want_gain_auto;
     volatile bool     gain_pending;
@@ -95,6 +145,25 @@ static struct {
 static void process_block(const uint8_t *data, size_t bytes)
 {
     int16_t out[2 * OUT_CHUNK_FRAMES];
+
+    /* digital fine tuning: cheap, phase-continuous, no-op when unchanged */
+    rtl_dsp_set_offset(&S.dsp, __atomic_load_n(&S.dig_offset_hz, __ATOMIC_ACQUIRE));
+
+    if (__atomic_exchange_n(&S.wide_pending, false, __ATOMIC_ACQUIRE)) {
+        const bool wide = S.want_wide;
+        rtl_dsp_set_wide(&S.dsp, wide);
+        S.wide = wide;
+        S.rate_mult = wide ? (RTL_DSP_WIDE_RATE / RTL_DSP_OUT_RATE) : 1u;
+        S.target_raw = RTL_RATE_TARGET_FRAMES * S.rate_mult;
+        S.high_water_raw = (RTL_RATE_TARGET_FRAMES * 12u / 5u) * S.rate_mult;
+        /* Flush: frames already queued are at the OLD rate's duration and would corrupt
+         * the drift-level math if left mixed with new-rate frames. Safe to do here even
+         * though `tail` belongs to the reader: this only ever moves `head` forward to
+         * meet it (never past it), so the reader never sees head-tail go negative. */
+        const uint32_t tail_now = __atomic_load_n(&S.tail, __ATOMIC_ACQUIRE);
+        __atomic_store_n(&S.head, tail_now, __ATOMIC_RELEASE);
+        S.primed = false;
+    }
 
     rtl_dsp_set_step(&S.dsp, S.step_req);
 
@@ -176,6 +245,16 @@ static bool start_stream(void)
     }
 
     rtl_dsp_init(&S.dsp, RTL_SOURCE_CONJUGATE_IQ != 0);
+    rtl_dsp_set_wide(&S.dsp, S.want_wide);
+    /* (re)starting tunes the dongle to the wanted frequency: no digital offset */
+    S.hw_lo_hz = S.want_lo_hz;
+    __atomic_store_n(&S.dig_offset_hz, 0, __ATOMIC_RELEASE);
+    S.hw_valid = true;
+    S.wide = S.want_wide;
+    S.rate_mult = S.wide ? (RTL_DSP_WIDE_RATE / RTL_DSP_OUT_RATE) : 1u;
+    S.target_raw = RTL_RATE_TARGET_FRAMES * S.rate_mult;
+    S.high_water_raw = (RTL_RATE_TARGET_FRAMES * 12u / 5u) * S.rate_mult;
+    __atomic_store_n(&S.wide_pending, false, __ATOMIC_RELAXED);
     S.step_req = 1.0f;
     S.primed = false;
 
@@ -265,15 +344,54 @@ static void ctl_task(void *arg)
 
         ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(250));
 
+#if RTL_SOURCE_RECENTRE_MS > 0
+        /* Idle with a digital offset in place: one physical retune to recentre. */
+        if (__atomic_load_n(&S.dig_offset_hz, __ATOMIC_ACQUIRE) != 0 &&
+            (esp_timer_get_time() - S.last_tune_us) > (int64_t)RTL_SOURCE_RECENTRE_MS * 1000) {
+            __atomic_store_n(&S.lo_pending, true, __ATOMIC_RELEASE);
+        }
+#endif
+
         if (S.fault || esp_rtl_sdr_get_state(S.sdr) != ESP_RTL_SDR_STATE_STREAMING) {
             recover();
             continue;
         }
         if (__atomic_exchange_n(&S.lo_pending, false, __ATOMIC_ACQUIRE)) {
             const uint32_t lo = S.want_lo_hz;
+#ifdef RTL_SOURCE_RETUNE_LOG
+            /* How long does a real retune (pause bulk + drain + EP0 + resubmit, per
+             * esp_rtl_sdr's own source) actually take on this hardware? Needed to pick
+             * ui.c's SPECTRUM_DRAG_RETUNE_MIN_US on measurement instead of a guess -
+             * see that constant's comment. */
+            const int64_t t0 = esp_timer_get_time();
+#endif
             const esp_err_t err = esp_rtl_sdr_retune_hz(S.sdr, lo);
+#ifdef RTL_SOURCE_RETUNE_LOG
+            ESP_LOGI(TAG, "retune to %u Hz took %lld us", (unsigned)lo, (long long)(esp_timer_get_time() - t0));
+#endif
             if (err != ESP_OK) {
                 ESP_LOGW(TAG, "retune %u Hz failed: %s", (unsigned)lo, esp_rtl_sdr_err_to_name(err));
+            } else {
+                /* The dongle is now at lo. Whatever was requested meanwhile stays
+                 * digital if it is within the window of the new LO. */
+                S.hw_lo_hz = lo;
+                const int32_t rest = (int32_t)(S.want_lo_hz - lo);
+                if (rest == 0) {
+                    /* on target: nothing left to do (this is ALWAYS the case in WFM
+                     * after its own retune - the first version of this code sent
+                     * rest == 0 in wide mode to the "retune again" branch below and
+                     * looped forever, freezing the spectrum on entering WFM) */
+                    __atomic_store_n(&S.dig_offset_hz, 0, __ATOMIC_RELEASE);
+                } else if (!S.want_wide && rest >= -RTL_SOURCE_DIGITAL_WINDOW_HZ &&
+                           rest <= RTL_SOURCE_DIGITAL_WINDOW_HZ) {
+                    /* moved a little further meanwhile: finish digitally */
+                    __atomic_store_n(&S.dig_offset_hz, rest, __ATOMIC_RELEASE);
+                } else {
+                    /* moved beyond the window (or WFM moved on): one more real retune */
+                    __atomic_store_n(&S.dig_offset_hz, 0, __ATOMIC_RELEASE);
+                    __atomic_store_n(&S.lo_pending, true, __ATOMIC_RELEASE);
+                    xTaskNotifyGive(S.ctl);
+                }
             }
         }
         if (__atomic_exchange_n(&S.gain_pending, false, __ATOMIC_ACQUIRE)) {
@@ -304,6 +422,9 @@ esp_err_t rtl_source_init(uint32_t initial_lo_hz, int initial_gain_db)
     S.want_gain_db = initial_gain_db;
     S.want_gain_auto = false;
     S.step_req = 1.0f;
+    S.rate_mult = 1u;
+    S.target_raw = RTL_RATE_TARGET_FRAMES;
+    S.high_water_raw = RTL_RATE_TARGET_FRAMES * 12u / 5u;   /* == 6144, same as narrow mode always used before */
     rtl_rate_ctl_reset(&S.rc);
 
     TaskHandle_t ctl = NULL;
@@ -319,6 +440,18 @@ esp_err_t rtl_source_init(uint32_t initial_lo_hz, int initial_gain_db)
 void rtl_source_set_freq(uint32_t lo_hz)
 {
     S.want_lo_hz = lo_hz;
+    S.last_tune_us = esp_timer_get_time();
+
+    /* Within the digital window of the hardware LO (and not in WFM, which needs
+     * the whole 192 kSps band): move the NCO only - instant, stream untouched.
+     * A physical retune already in flight picks up the final value itself. */
+    if (S.hw_valid && !S.want_wide && !__atomic_load_n(&S.lo_pending, __ATOMIC_ACQUIRE)) {
+        const int32_t d = (int32_t)(lo_hz - S.hw_lo_hz);
+        if (d >= -RTL_SOURCE_DIGITAL_WINDOW_HZ && d <= RTL_SOURCE_DIGITAL_WINDOW_HZ) {
+            __atomic_store_n(&S.dig_offset_hz, d, __ATOMIC_RELEASE);
+            return;
+        }
+    }
     __atomic_store_n(&S.lo_pending, true, __ATOMIC_RELEASE);
     if (S.ctl != NULL) {
         xTaskNotifyGive(S.ctl);
@@ -337,6 +470,25 @@ void rtl_source_set_gain_db(int gain_db)
     }
 }
 
+void rtl_source_set_wide(bool wide)
+{
+    if (S.want_wide == wide) {
+        return;   /* already there, or already requested: nothing to do */
+    }
+    S.want_wide = wide;
+    __atomic_store_n(&S.wide_pending, true, __ATOMIC_RELEASE);
+    if (wide && __atomic_load_n(&S.dig_offset_hz, __ATOMIC_ACQUIRE) != 0) {
+        /* WFM uses the whole 192 kSps band: centre the dongle, drop the offset */
+        __atomic_store_n(&S.lo_pending, true, __ATOMIC_RELEASE);
+        if (S.ctl != NULL) {
+            xTaskNotifyGive(S.ctl);
+        }
+    }
+    /* No need to wake anyone: process_block() picks this up on its own very next
+     * call, which arrives every ~8.5 ms regardless (USB delivery keeps running
+     * unconditionally - a mode switch never stops or restarts the dongle). */
+}
+
 void rtl_source_set_gain_auto(bool enable)
 {
     S.want_gain_auto = enable;
@@ -348,7 +500,7 @@ void rtl_source_set_gain_auto(bool enable)
 
 esp_err_t rtl_source_read_float(float *i, float *q, size_t frames, uint32_t timeout_ms)
 {
-    if (S.ring == NULL || frames == 0 || frames > HIGH_WATER_FRAMES / 2) {
+    if (S.ring == NULL || frames == 0 || frames > S.high_water_raw / 2) {
         return ESP_ERR_INVALID_STATE;
     }
     S.reader = xTaskGetCurrentTaskHandle();
@@ -359,7 +511,10 @@ esp_err_t rtl_source_read_float(float *i, float *q, size_t frames, uint32_t time
 
     for (;;) {
         avail = __atomic_load_n(&S.head, __ATOMIC_ACQUIRE) - S.tail;
-        if (!S.primed && avail >= RTL_RATE_PRIME_FRAMES) {
+        const uint32_t rm = S.rate_mult ? S.rate_mult : 1u;
+        /* PRIME_FRAMES is a fixed 48 kSps-equivalent threshold (~75 ms): normalize the
+         * raw ring level by the active rate's multiplier before comparing against it. */
+        if (!S.primed && (avail / rm) >= RTL_RATE_PRIME_FRAMES) {
             rtl_rate_ctl_reset(&S.rc);
             S.step_req = 1.0f;
             S.primed = true;
@@ -385,16 +540,21 @@ esp_err_t rtl_source_read_float(float *i, float *q, size_t frames, uint32_t time
 
     uint32_t tail = S.tail;
 
-    /* Far above target: the consumer stalled for a while. Jump to the target level. */
-    if (head - tail > HIGH_WATER_FRAMES) {
-        const uint32_t skip = (head - tail) - RTL_RATE_TARGET_FRAMES;
+    /* Far above target: the consumer stalled for a while. Jump to the target level.
+     * Both thresholds are pre-scaled to the active rate's raw frames (see process_block()). */
+    if (head - tail > S.high_water_raw) {
+        const uint32_t skip = (head - tail) - S.target_raw;
         tail += skip;
         S.skipped += skip;
         rtl_rate_ctl_reset(&S.rc);
     }
 
+    const uint32_t rm2 = S.rate_mult ? S.rate_mult : 1u;
     const uint32_t now32 = (uint32_t)esp_timer_get_time();
-    const float level = rtl_level_estimate(head - tail, (int64_t)(now32 - t_arr32)); /* wraps correctly: both are the low 32 bits of the same clock, and the gap is always well under 2^31 us */
+    /* Normalize back to 48 kSps-equivalent frames: rtl_level_estimate()'s own "since
+     * last arrival" extrapolation is hardcoded in those units (RTL_DSP_OUT_RATE), and
+     * the drift controller's constants (RTL_RATE_TARGET_FRAMES etc.) are too. */
+    const float level = rtl_level_estimate((head - tail) / rm2, (int64_t)(now32 - t_arr32)); /* wraps correctly: both are the low 32 bits of the same clock, and the gap is always well under 2^31 us */
     S.step_req = rtl_rate_ctl_update(&S.rc, level, true);
 
     const float k = 1.0f / (float)INT16_MAX;
@@ -418,6 +578,7 @@ void rtl_source_get_stats(rtl_source_stats_t *out)
     out->streaming = S.streaming;
     out->fifo_frames = __atomic_load_n(&S.head, __ATOMIC_ACQUIRE) - __atomic_load_n(&S.tail, __ATOMIC_ACQUIRE);
     out->step_ppm = (S.step_req - 1.0f) * 1e6f;
+    out->wide = S.wide;
     out->fifo_overruns = S.fifo_overruns;
     out->underruns = S.underruns;
     out->skipped_frames = S.skipped;

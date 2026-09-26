@@ -31,12 +31,27 @@ extern "C" {
 #define RTL_DSP_OUT_RATE   (RTL_DSP_MID_RATE / RTL_DSP_FIR_R) /* 48 kSps                     */
 #define RTL_DSP_FIR_TAPS   96
 
+/*
+ * Wideband (WFM) output rate: the CIC+resampler stage's own output, tapped
+ * directly, before the 96-tap FIR decimates it a further 4:1 down to
+ * RTL_DSP_OUT_RATE. 192 kSps gives +-96 kHz of I/Q bandwidth, enough for a
+ * 75 kHz-deviation broadcast FM signal (Carson bandwidth ~180 kHz) with a
+ * little headroom, and enough room for a future stereo pilot (19 kHz) and
+ * RDS (57 kHz) decoder to tap the same wide stream, though decoding those is
+ * not implemented here. See rtl_dsp_set_wide().
+ */
+#define RTL_DSP_WIDE_RATE  RTL_DSP_MID_RATE  /* == RTL_DSP_OUT_RATE * 4; sdr.h's WFM_BUFFER_SIZE assumes that ratio */
+
 #define RTL_DSP_STEP_MIN   0.99f
 #define RTL_DSP_STEP_MAX   1.01f
 
-/* Upper bound of output frames produced from n_bytes of CU8 input. */
+/* Upper bound of output frames produced from n_bytes of CU8 input, narrow (default) mode. */
 #define RTL_DSP_MAX_FRAMES(n_bytes) \
     ((size_t)(n_bytes) / 2u / (RTL_DSP_CIC_R * RTL_DSP_FIR_R) * 102u / 100u + 4u)
+
+/* Same, for wide mode (rtl_dsp_set_wide(d, true)): only the CIC decimates, not the FIR. */
+#define RTL_DSP_WIDE_MAX_FRAMES(n_bytes) \
+    ((size_t)(n_bytes) / 2u / RTL_DSP_CIC_R * 102u / 100u + 4u)
 
 typedef struct {
     /* CIC state, 4 integrators + 4 combs per channel (unsigned: defined wrap-around) */
@@ -57,7 +72,16 @@ typedef struct {
     float coeff[RTL_DSP_FIR_TAPS];
 
     bool conjugate;         /* negate Q on output (flip spectrum orientation) */
+    bool wide;              /* true: emit at RTL_DSP_WIDE_RATE, skip the FIR decimator */
     uint32_t out_dropped;   /* frames lost because max_out was too small      */
+
+    /* Digital fine tuning: NCO applied right after the CIC (exactly 192 kSps on
+     * the dongle's clock, i.e. before the drift resampler, so the shift is exact
+     * in Hz). Phase-continuous: changing the offset only changes the increment. */
+    int32_t nco_offset_hz;  /* 0 = NCO bypassed (bit-identical to no NCO)    */
+    float nco_c, nco_s;     /* current phasor                                */
+    float nco_dc, nco_ds;   /* per-sample rotation                           */
+    uint32_t nco_renorm;    /* samples since the phasor was renormalized     */
 } rtl_dsp_t;
 
 /* Reset all state and (re)design the FIR. conjugate: see above. */
@@ -65,6 +89,26 @@ void rtl_dsp_init(rtl_dsp_t *d, bool conjugate);
 
 /* Resampling step in input samples per output sample at 192 kSps (1.0 = nominal). Clamped. */
 void rtl_dsp_set_step(rtl_dsp_t *d, float step);
+
+/*
+ * Switch between the narrow (RTL_DSP_OUT_RATE, default) and wide (RTL_DSP_WIDE_RATE)
+ * output tap. Safe to call at any time, including between rtl_dsp_process() calls:
+ * the CIC and resampler run unconditionally either way, so there is no glitch or
+ * restart, only a change in which output rate the NEXT call produces. The caller
+ * (rtl_source.c) is responsible for not mixing frames produced under different
+ * modes in a FIFO that assumes one constant frame duration - see rtl_source_set_wide().
+ */
+void rtl_dsp_set_wide(rtl_dsp_t *d, bool wide);
+
+/*
+ * Digital retune: shift the signal so that what sits offset_hz above the
+ * hardware LO comes out at the centre - the same result as retuning the dongle
+ * by offset_hz, without stopping the USB stream. Applied before the 192 -> 48 kSps
+ * FIR, which keeps +-24 kHz, so |offset_hz| must stay well inside +-96 kHz
+ * (rtl_source.c keeps it within RTL_SOURCE_DIGITAL_WINDOW_HZ). Safe to call
+ * between rtl_dsp_process() calls; the phase is continuous.
+ */
+void rtl_dsp_set_offset(rtl_dsp_t *d, int32_t offset_hz);
 
 /*
  * Convert n_bytes of interleaved CU8 (I0,Q0,I1,Q1,...) to 48 kSps frames.

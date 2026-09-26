@@ -28,6 +28,18 @@ extern "C"
     void refresca_indicadores(void);
     void indicadores_create(lv_obj_t *parent);
     void indicador_update(int idx, const char *texto, bool verde);
+
+    /* Waterfall / FT8-cascade color palette (palette_id_t in palettes.h).
+     * ui_set_palette() applies it immediately and saves it in NVS. Call from
+     * the LVGL context. */
+    /* AIS mode (menu button): enter/leave, state, and a callback the menu uses
+     * to refresh its button when the state changes. LVGL context only. */
+    void ui_ais_toggle(void);
+    bool ui_ais_is_active(void);
+    void ui_ais_set_state_callback(void (*cb)(void));
+
+    int ui_get_palette(void);
+    void ui_set_palette(int id);
     static void init_styles_once(void);
 
     extern lv_timer_t *timer_pantalla;

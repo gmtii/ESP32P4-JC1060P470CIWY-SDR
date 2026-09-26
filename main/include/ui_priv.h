@@ -39,6 +39,8 @@ extern "C"
 
     lv_obj_t *smeter_obj;
     lv_obj_t *freq_label;
+    lv_obj_t *label_modo_info; /* top-left info block: current demod mode, plain text (not a button) */
+    lv_obj_t *label_clock;     /* top-right corner: placeholder, uptime since boot until real RTC/NTP lands */
 
     lv_obj_t *label_modos;
     lv_obj_t *label_step;
@@ -54,12 +56,12 @@ extern "C"
 
     lv_obj_t *value_label;
 
-    static lv_obj_t *meter_img;
 
     static lv_obj_t *indicador;
 
     lv_timer_t *timer_pantalla;
     lv_timer_t *timer_smeter;
+    lv_timer_t *timer_clock;
     lv_timer_t *timer_cpu;
     lv_timer_t *timer_debounce;
 
@@ -139,14 +141,25 @@ extern "C"
 #define SMETER_ANGLE_MIN 40  // grados
 #define SMETER_ANGLE_MAX 140 // grados
 
-    typedef struct
-    {
-        lv_obj_t *cont;
-        lv_obj_t *needle;
-        lv_point_precise_t pts[2];
-    } smeter_t;
+/*
+ * S-meter panel (top-left). The bar itself (scale ticks, 54 LED-style segments,
+ * peak marker) is rendered by smeter_draw.c into a small RGB565 canvas; the
+ * scale numbers and readouts are LVGL labels. Geometry below matches the host
+ * preview rendered from the same smeter_draw.c code.
+ */
+#define SMETER_PANEL_X 5
+#define SMETER_PANEL_Y 4
+#define SMETER_PANEL_W 345
+#define SMETER_PANEL_H 128
+#define SMETER_CANVAS_X 10 /* inside the panel */
+#define SMETER_CANVAS_Y 30
+#define SMETER_LABEL_Y 8
 
-    smeter_t smeter;
+    lv_obj_t *smeter_canvas;
+    uint16_t *smeter_canvas_buf;
+    lv_obj_t *smeter_lbl_s;
+    lv_obj_t *smeter_lbl_dbm;
+    lv_obj_t *smeter_lbl_peak;
 
 #ifdef __cplusplus
 }

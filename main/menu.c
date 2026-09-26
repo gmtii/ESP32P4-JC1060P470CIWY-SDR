@@ -25,6 +25,7 @@
 
 #include "rtl_source.h"
 
+#include "palettes.h"
 #include "menu.h"
 
 #include "lvgl.h"
@@ -42,6 +43,8 @@ extern int pasos_indice;
 extern bool f_actualiza;
 extern int filtro_indice;
 extern char *filtros_texto[5];
+extern uint8_t spec_smooth_passes; /* "SPT" - see sdr_priv.h's comment */
+#define SPECTRUM_LINE_SMOOTH_MAX 5
 extern char *agc_texto[6];
 
 /* =========================================================
@@ -49,6 +52,8 @@ extern char *agc_texto[6];
  * ========================================================= */
 static int32_t var_slider1 = 50; /* output volume, percent */
 static int32_t var_slider2 = 30; /* RTL tuner gain, dB */
+
+int menu_get_rtl_gain_db(void) { return (int)var_slider2; }
 static int32_t var_slider4 = 5;
 
 static bool var_btn1 = false;
@@ -222,16 +227,26 @@ static void btn7_cb(lv_event_t *e)
         f_nrss = false;
 }
 
+/*
+ * "SPT" - spectrum spatial-line smoothing cycle (0..SPECTRUM_LINE_SMOOTH_MAX), per
+ * Jorge, ported from a sibling GD32F450 SDR project (see sdr_priv.h's
+ * spec_smooth_passes comment for the DSP side). Repurposed from this slot's old
+ * FILTRO job: main screen's own btn_filtros (ui.c) already does the exact same
+ * filtro_indice cycling, making this menu-grid copy redundant.
+ */
 static void btn8_cb(lv_event_t *e)
 {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED)
         return;
     var_btn8 = !var_btn8;
-    filtro_indice++;
-    if (filtro_indice > 4)
-        filtro_indice = 0;
-    f_actualiza = true;
-    dibuja_pasabanda();
+
+    spec_smooth_passes = (uint8_t)((spec_smooth_passes + 1U) % (SPECTRUM_LINE_SMOOTH_MAX + 1U));
+
+    lv_obj_t *lbl = lv_obj_get_child(btn8_filtro, 0);
+    if (lbl != NULL)
+    {
+        lv_label_set_text_fmt(lbl, "SPT %d", (int)spec_smooth_passes);
+    }
 }
 
 static void btn9_cb(lv_event_t *e)
@@ -248,12 +263,26 @@ static void btn9_cb(lv_event_t *e)
     AGC_prep();
 }
 
+/*
+ * NFM / WFM. Mirrors the dedicated FM button on the main screen (ui.c's btn4_cb):
+ * WFM tunes on-frequency (no 12 kHz offset) and defaults the tuner to AGC, since
+ * broadcast FM carriers are always strong; leaving it restores the RTL gain
+ * slider's manual value. Kept as two separate buttons here (rather than one
+ * toggle like ui.c's) since the menu has room and it avoids a relabelling step.
+ */
 static void btn10_cb(lv_event_t *e)
 {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED)
         return;
     var_btn10 = !var_btn10;
-    printf("BTN10 -> %d\n", var_btn10);
+
+    demod_modo = DEMOD_FM;
+    currentVFO.demod_modo = demod_modo;
+    rtl_source_set_freq(currentVFO.Frec - lo_offset_for_mode(demod_modo));
+    rtl_source_set_gain_db(var_slider2);
+
+    dibuja_pasabanda();
+    refresca_indicadores();
 }
 
 static void btn11_cb(lv_event_t *e)
@@ -261,7 +290,56 @@ static void btn11_cb(lv_event_t *e)
     if (lv_event_get_code(e) != LV_EVENT_CLICKED)
         return;
     var_btn11 = !var_btn11;
-    printf("BTN11 -> %d\n", var_btn11);
+
+    demod_modo = DEMOD_WFM;
+    currentVFO.demod_modo = demod_modo;
+    rtl_source_set_freq(currentVFO.Frec - lo_offset_for_mode(demod_modo));
+    rtl_source_set_gain_auto(true);
+
+    dibuja_pasabanda();
+    refresca_indicadores();
+}
+
+/*
+ * PALETTE: cycles the waterfall / FT8-cascade color palette through the full
+ * SDR++ set (palettes.c). Applied live and saved in NVS by ui_set_palette().
+ */
+static lv_obj_t *btn13_palette = NULL;
+
+static void palette_btn_label(void)
+{
+    lv_obj_t *lbl = (btn13_palette != NULL) ? lv_obj_get_child(btn13_palette, 0) : NULL;
+    if (lbl != NULL)
+    {
+        lv_label_set_text_fmt(lbl, "PALETTE\n%s", palette_name(ui_get_palette()));
+    }
+}
+
+/* AIS: enter/leave the AIS receiver (ui.c: 162.000 MHz, WFM wide path). */
+static lv_obj_t *btn14_ais = NULL;
+
+static void ais_btn_label(void)
+{
+    lv_obj_t *lbl = (btn14_ais != NULL) ? lv_obj_get_child(btn14_ais, 0) : NULL;
+    if (lbl != NULL)
+    {
+        lv_label_set_text(lbl, ui_ais_is_active() ? "AIS\nON" : "AIS\nOFF");
+    }
+}
+
+static void btn14_cb(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED)
+        return;
+    ui_ais_toggle();
+}
+
+static void btn13_cb(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED)
+        return;
+    ui_set_palette((ui_get_palette() + 1) % PALETTE_COUNT);
+    palette_btn_label();
 }
 
 /* =========================================================
@@ -274,8 +352,9 @@ static void btn12_cb(lv_event_t *e)
     if (lv_event_get_code(e) != LV_EVENT_CLICKED)
         return;
 
-    if (cont_menu && lv_obj_is_valid(cont_menu)) {
-        lv_obj_del_async(cont_menu); 
+    if (cont_menu && lv_obj_is_valid(cont_menu))
+    {
+        lv_obj_del_async(cont_menu);
 
         cont_menu = NULL;
 
@@ -283,6 +362,9 @@ static void btn12_cb(lv_event_t *e)
         menu_scr = NULL;
         row_sliders = NULL;
         grid_btns = NULL;
+        btn13_palette = NULL;
+        btn14_ais = NULL;
+        ui_ais_set_state_callback(NULL);
 
         box_s1 = sl_s1 = NULL;
         box_s2 = sl_s2 = NULL;
@@ -406,11 +488,16 @@ void ui_create_control_panel(void)
     create_slider_block(row_sliders, "Brightness", 1, 200,
                         var_slider4, slider_brightness, &box_s4, &sl_s4, &lbl_s4);
 
-    /* ---------- Botonera (2 filas x 6 botones) ---------- */
+    /* ---------- Botonera (3 filas: 6 + 6 + PALETTE) ----------
+     * Height and row gap set explicitly so the third row fits:
+     * 3 x 60 px buttons + 2 x 10 px gaps = 200 px, inside the 500 px panel
+     * (16 px padding x 2 + 190 px sliders + column gap + this grid). */
     grid_btns = lv_obj_create(cont_menu);
     lv_obj_set_width(grid_btns, lv_pct(100));
-    lv_obj_set_height(grid_btns, 200);
+    lv_obj_set_height(grid_btns, 210);
     lv_obj_set_style_pad_all(grid_btns, 0, 0);
+    lv_obj_set_style_pad_row(grid_btns, 10, 0);
+    lv_obj_remove_flag(grid_btns, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_style_border_width(grid_btns, 0, 0);
 
     /* Flex: filas con wrap */
@@ -429,11 +516,32 @@ void ui_create_control_panel(void)
     btn6_saml = create_button(grid_btns, "SAML", btn6_cb);
 
     btn7_nr = create_button(grid_btns, "NR", btn7_cb);
-    btn8_filtro = create_button(grid_btns, "FILTRO", btn8_cb);
+    {
+        /* The menu grid is destroyed and rebuilt from scratch every time it's
+         * closed/reopened (see btn12_cb: lv_obj_del_async(cont_menu) + all these
+         * pointers set to NULL) - create_button() only ever takes a fixed literal
+         * for its initial label, so this must be formatted from the LIVE value
+         * every time, or the button keeps showing "SPT 0" on reopen regardless of
+         * what spec_smooth_passes actually holds (the value itself is a plain
+         * global and does persist correctly across that rebuild - only the label
+         * was wrong). */
+        char spt_label[8];
+        snprintf(spt_label, sizeof(spt_label), "SPT %d", (int)spec_smooth_passes);
+        btn8_filtro = create_button(grid_btns, spt_label, btn8_cb);
+    }
     btn9_agc = create_button(grid_btns, "AGC", btn9_cb);
-    btn10 = create_button(grid_btns, "BTN 10", btn10_cb);
-    btn11 = create_button(grid_btns, "BTN 11", btn11_cb);
+    btn10 = create_button(grid_btns, "NFM", btn10_cb);
+    btn11 = create_button(grid_btns, "WFM", btn11_cb);
     btn12_close = create_button(grid_btns, LV_SYMBOL_CLOSE, btn12_cb);
+
+    btn13_palette = create_button(grid_btns, "PALETTE", btn13_cb);
+    lv_obj_set_width(btn13_palette, 180); /* room for "Temper Colors" */
+    lv_obj_set_style_text_align(lv_obj_get_child(btn13_palette, 0), LV_TEXT_ALIGN_CENTER, 0);
+    palette_btn_label();
+    btn14_ais = create_button(grid_btns, "AIS", btn14_cb);
+    lv_obj_set_style_text_align(lv_obj_get_child(btn14_ais, 0), LV_TEXT_ALIGN_CENTER, 0);
+    ais_btn_label();
+    ui_ais_set_state_callback(ais_btn_label);
 }
 
 /* ------------------------------------------------------------------------------- */
@@ -494,18 +602,21 @@ static void freq_btnm_event_cb(lv_event_t *e)
         {
             currentVFO.Frec = hz;
             refresca_VFO();
-            rtl_source_set_freq(currentVFO.Frec - FREQ_CONV_OFFSET);
+            rtl_source_set_freq(currentVFO.Frec - lo_offset_for_mode(demod_modo));
+            freq_popup_close();
+
+            inicia_timers();
         }
         return;
     }
 
     if (strcmp(txt, LV_SYMBOL_OK) == 0)
     {
-        uint32_t hz = parse_freq(lv_textarea_get_text(ta_freq), 1e6);
-        if (hz)
-            currentVFO.Frec = hz;
+        //uint32_t hz = parse_freq(lv_textarea_get_text(ta_freq), 1e6);
+        //if (hz)
+        //    currentVFO.Frec = hz;
         refresca_VFO();
-        rtl_source_set_freq(currentVFO.Frec - FREQ_CONV_OFFSET);
+        rtl_source_set_freq(currentVFO.Frec - lo_offset_for_mode(demod_modo));
         freq_popup_close();
 
         inicia_timers();
